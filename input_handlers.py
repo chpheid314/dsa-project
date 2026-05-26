@@ -1,6 +1,9 @@
 from typing import Optional
+
 import tcod.event
-from actions import Action, EscapeAction, MovementAction
+
+from actions import Action, BumpAction, EscapeAction
+
 from tcod.event import KeySym
 
 class EventHandler(tcod.event.EventDispatch[Action]):
@@ -12,13 +15,13 @@ class EventHandler(tcod.event.EventDispatch[Action]):
         key = event.sym
 
         if key == KeySym.UP:
-            action = MovementAction(dx=0, dy=-1)
+            action = BumpAction(dx=0, dy=-1)
         elif key == KeySym.DOWN:
-            action = MovementAction(dx=0, dy=1)
+            action = BumpAction(dx=0, dy=1)
         elif key == KeySym.LEFT:
-            action = MovementAction(dx=-1, dy=0)
+            action = BumpAction(dx=-1, dy=0)
         elif key == KeySym.RIGHT:
-            action = MovementAction(dx=1, dy=0)
+            action = BumpAction(dx=1, dy=0)
 
         elif key == KeySym.ESCAPE:
             action = EscapeAction()
