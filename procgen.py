@@ -4,6 +4,7 @@ import random
 from typing import Iterator, List, Tuple, TYPE_CHECKING
 
 import tcod
+from tcod.bsp import BSP
 
 import entity_factories
 from game_map import GameMap
@@ -39,6 +40,44 @@ class RectangularRoom:
             and self.y1 <= other.y2
             and self.y2 >= other.y1
         )
+    
+
+def create_room_from_leaf(
+    leaf: BSP,
+    room_min_size: int,
+    room_max_size: int,
+) -> RectangularRoom | None:
+
+    if leaf.width < room_min_size + 2 or leaf.height < room_min_size + 2:
+        return None
+
+    room_width = random.randint(
+        room_min_size,
+        min(room_max_size, leaf.width - 1)
+    )
+
+    room_height = random.randint(
+        room_min_size,
+        min(room_max_size, leaf.height - 1)
+    )
+
+    x = random.randint(
+        leaf.x,
+        leaf.x + leaf.width - room_width
+    )
+
+    y = random.randint(
+        leaf.y,
+        leaf.y + leaf.height - room_height
+    )
+
+    return RectangularRoom(
+        x,
+        y,
+        room_width,
+        room_height,
+    )
+
     
 def place_entities(
     room: RectangularRoom, dungeon: GameMap, maximum_monsters: int,
@@ -84,41 +123,66 @@ def generate_dungeon(
     max_monsters_per_room: int,
     engine: Engine,
 ) -> GameMap:
-    """Generate a new dungeon map."""
+
     player = engine.player
-    dungeon = GameMap(engine, map_width, map_height, entities=[player])
 
-    rooms: List[RectangularRoom] = []
+    dungeon = GameMap(
+        engine,
+        map_width,
+        map_height,
+        entities=[player]
+    )
 
-    for r in range(max_rooms):
-        room_width = random.randint(room_min_size, room_max_size)
-        room_height = random.randint(room_min_size, room_max_size)
+    rooms = []
 
-        x = random.randint(0, dungeon.width - room_width - 1)
-        y = random.randint(0, dungeon.height - room_height - 1)
+    bsp = BSP(
+        x=0,
+        y=0,
+        width=map_width,
+        height=map_height
+    )
 
-        # "RectangularRoom" class makes rectangles easier to work with
-        new_room = RectangularRoom(x, y, room_width, room_height)
+    bsp.split_recursive(
+        depth=5,
+        min_width=room_max_size + 2,
+        min_height=room_max_size + 2,
+        max_horizontal_ratio=1.5,
+        max_vertical_ratio=1.5,
+    )
 
-        # Run through the other rooms and see if they intersect with this one.
-        if any(new_room.intersects(other_room) for other_room in rooms):
-            continue  # This room intersects, so go to the next attempt.
-        # If there are no intersections then the room is valid.
+    leaves = [node for node in bsp.pre_order() if not node.children]
 
-        # Dig out this rooms inner area.
-        dungeon.tiles[new_room.inner] = tile_types.floor
+    for leaf in leaves:
 
-        if len(rooms) == 0:
-            # The first room, where the player starts.
-            player.place(*new_room.center, dungeon)
-        else:  # All rooms after the first.
-            # Dig out a tunnel between this room and the previous one.
-            for x, y in tunnel_between(rooms[-1].center, new_room.center):
+        room = create_room_from_leaf(
+            leaf,
+            room_min_size,
+            room_max_size,
+        )
+
+        if room is None:
+            continue
+
+        dungeon.tiles[room.inner] = tile_types.floor
+
+        if not rooms:
+            player.place(*room.center, dungeon)
+
+        else:
+            previous_room = rooms[-1]
+
+            for x, y in tunnel_between(
+                previous_room.center,
+                room.center,
+            ):
                 dungeon.tiles[x, y] = tile_types.floor
 
-        place_entities(new_room, dungeon, max_monsters_per_room)
+        place_entities(
+            room,
+            dungeon,
+            max_monsters_per_room,
+        )
 
-        # Finally, append the new room to the list.
-        rooms.append(new_room)
+        rooms.append(room)
 
     return dungeon
