@@ -81,7 +81,7 @@ class MainGameEventHandler(EventHandler):
             action = WaitAction(player)
         elif key == KeySym.ESCAPE:
             action = EscapeAction(player)
-        elif key == KeySym.v:
+        elif key == KeySym.V:
             self.engine.event_handler = HistoryViewer(self.engine)
 
         return action
