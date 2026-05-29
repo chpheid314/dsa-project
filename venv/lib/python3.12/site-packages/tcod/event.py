@@ -1,0 +1,3232 @@
+"""A light-weight implementation of event handling built on calls to SDL.
+
+Many event constants are derived directly from SDL.
+For example: ``tcod.event.KeySym.UP`` and ``tcod.event.Scancode.A`` refer to
+SDL's ``SDLK_UP`` and ``SDL_SCANCODE_A`` respectfully.
+`See this table for all of SDL's keyboard constants.
+<https://wiki.libsdl.org/SDL_Keycode>`_
+
+Printing any event will tell you its attributes in a human readable format.
+An events type attribute if omitted is just the classes name with all letters upper-case.
+
+As a general guideline, you should use :any:`KeyboardEvent.sym` for command inputs,
+and :any:`TextInput.text` for name entry fields.
+
+Example::
+
+    import tcod
+
+    KEY_COMMANDS = {
+        tcod.event.KeySym.UP: "move N",
+        tcod.event.KeySym.DOWN: "move S",
+        tcod.event.KeySym.LEFT: "move W",
+        tcod.event.KeySym.RIGHT: "move E",
+    }
+
+    context = tcod.context.new()
+    while True:
+        console = context.new_console()
+        context.present(console, integer_scaling=True)
+        for pixel_event in tcod.event.wait():
+            event = context.convert_event(pixel_event)  # Convert mouse pixel coordinates to tile coordinates
+            print(event)  # Print all events, for learning and debugging
+            if isinstance(event, tcod.event.Quit):
+                raise SystemExit()
+            elif isinstance(event, tcod.event.KeyDown):
+                print(f"{event.sym=}, {event.scancode=}")  # Show Scancode and KeySym enum names
+                if event.sym in KEY_COMMANDS:
+                    print(f"Command: {KEY_COMMANDS[event.sym]}")
+            elif isinstance(event, tcod.event.MouseButtonDown):
+                print(f"{event.button=}, {event.integer_position=}")  # Show mouse button and tile
+            elif isinstance(event, tcod.event.MouseMotion):
+                print(f"{event.integer_position=}, {event.integer_motion=}")  # Current mouse tile and tile motion
+
+Python 3.10 introduced `match statements <https://docs.python.org/3/tutorial/controlflow.html#match-statements>`_
+which can be used to dispatch events more gracefully:
+
+Example::
+
+    import tcod
+
+    KEY_COMMANDS = {
+        tcod.event.KeySym.UP: "move N",
+        tcod.event.KeySym.DOWN: "move S",
+        tcod.event.KeySym.LEFT: "move W",
+        tcod.event.KeySym.RIGHT: "move E",
+    }
+
+    context = tcod.context.new()
+    while True:
+        console = context.new_console()
+        context.present(console, integer_scaling=True)
+        for pixel_event in tcod.event.wait():
+            event = context.convert_event(pixel_event)  # Converts mouse pixel coordinates to tile coordinates.
+            match event:
+                case tcod.event.Quit():
+                    raise SystemExit()
+                case tcod.event.KeyDown(sym=sym) if sym in KEY_COMMANDS:
+                    print(f"Command: {KEY_COMMANDS[sym]}")
+                case tcod.event.KeyDown(sym=sym, scancode=scancode, mod=mod, repeat=repeat):
+                    print(f"KeyDown: {sym=}, {scancode=}, {mod=}, {repeat=}")
+                case tcod.event.MouseButtonDown(button=button, integer_position=tile):
+                    print(f"MouseButtonDown: {button=}, {tile=}")
+                case tcod.event.MouseMotion(integer_position=tile, integer_motion=tile_motion):
+                    assert isinstance(pixel_event, tcod.event.MouseMotion)
+                    pixel_motion = pixel_event.motion
+                    print(f"MouseMotion: {pixel_motion=}, {tile=}, {tile_motion=}")
+                case tcod.event.Event() as event:
+                    print(event)  # Print unhandled events
+
+.. versionadded:: 8.4
+"""
+
+from __future__ import annotations
+
+import enum
+import functools
+import sys
+import warnings
+from collections.abc import Callable, Iterator, Mapping
+from math import floor
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Generic,
+    Literal,
+    NamedTuple,
+    Protocol,
+    TypeAlias,
+    TypedDict,
+    TypeVar,
+    overload,
+    runtime_checkable,
+)
+
+import attrs
+import numpy as np
+from typing_extensions import Self, deprecated
+
+import tcod.context
+import tcod.event_constants
+import tcod.sdl.joystick
+import tcod.sdl.render
+import tcod.sdl.sys
+from tcod.cffi import ffi, lib
+from tcod.event_constants import *  # noqa: F403
+from tcod.sdl.joystick import _HAT_DIRECTIONS
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
+T = TypeVar("T")
+_EventType = TypeVar("_EventType", bound="Event")
+
+_C_SDL_Event: TypeAlias = Any
+"""A CFFI pointer to an SDL_Event union.
+
+See SDL docs: https://wiki.libsdl.org/SDL3/SDL_Event
+"""
+
+
+class _ConstantsWithPrefix(Mapping[int, str]):
+    def __init__(self, constants: Mapping[int, str]) -> None:
+        self.constants = constants
+
+    def __getitem__(self, key: int) -> str:
+        return "tcod.event." + self.constants[key]
+
+    def __len__(self) -> int:
+        return len(self.constants)
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.constants)
+
+
+def _describe_bitmask(bits: int, table: Mapping[int, str], default: str = "0") -> str:
+    """Return a bitmask in human readable form.
+
+    This is a private function, used internally.
+
+    `bits` is the bitmask to be represented.
+
+    `table` is a reverse lookup table.
+
+    `default` is returned when no other bits can be represented.
+    """
+    result = []
+    for bit, name in table.items():
+        if bit & bits:
+            result.append(name)
+    if not result:
+        return default
+    return "|".join(result)
+
+
+def _pixel_to_tile(xy: tuple[float, float], /) -> Point[float] | None:
+    """Convert pixel coordinates to tile coordinates."""
+    if not lib.TCOD_ctx.engine:
+        return None
+    xy_out = ffi.new("double[2]", xy)
+    lib.TCOD_sys_pixel_to_tile(xy_out, xy_out + 1)
+    return Point(float(xy_out[0]), float(xy_out[1]))
+
+
+if sys.version_info >= (3, 11) or TYPE_CHECKING:
+
+    class Point(NamedTuple, Generic[T]):
+        """A 2D position used for events with mouse coordinates.
+
+        .. seealso::
+            :any:`MouseMotion` :any:`MouseButtonDown` :any:`MouseButtonUp`
+
+        .. versionchanged:: 19.0
+            Now uses floating point coordinates due to the port to SDL3.
+        """
+
+        x: T
+        """A pixel or tile coordinate starting with zero as the left-most position."""
+        y: T
+        """A pixel or tile coordinate starting with zero as the top-most position."""
+else:
+
+    class Point(NamedTuple):  # noqa: D101
+        x: Any
+        y: Any
+
+
+def _verify_tile_coordinates(xy: Point[int] | None) -> Point[int]:
+    """Check if an events tile coordinate is initialized and warn if not.
+
+    Always returns a valid Point object for backwards compatibility.
+    """
+    if xy is not None:
+        return xy
+    warnings.warn(
+        "This events tile coordinates are uninitialized!"
+        "\nYou MUST pass this event to `Context.convert_event` before you can"
+        " read its tile attributes.",
+        RuntimeWarning,
+        stacklevel=3,  # Called within other functions, never directly.
+    )
+    return Point(0, 0)
+
+
+def _init_sdl_video() -> None:
+    """Keyboard layout stuff needs SDL to be initialized first."""
+    if lib.SDL_WasInit(lib.SDL_INIT_VIDEO):
+        return
+    lib.SDL_InitSubSystem(lib.SDL_INIT_VIDEO)
+
+
+class Modifier(enum.IntFlag):
+    """Keyboard modifier flags, a bit-field of held modifier keys.
+
+    Use `bitwise and` to check if a modifier key is held.
+
+    The following example shows some common ways of checking modifiers.
+    All non-zero return values are considered true.
+
+    Example::
+
+        >>> import tcod.event
+        >>> mod = tcod.event.Modifier(4098)
+        >>> mod & tcod.event.Modifier.SHIFT  # Check if any shift key is held.
+        <Modifier.RSHIFT: 2>
+        >>> mod & tcod.event.Modifier.LSHIFT  # Check if left shift key is held.
+        <Modifier.NONE: 0>
+        >>> not mod & tcod.event.Modifier.LSHIFT  # Check if left shift key is NOT held.
+        True
+        >>> mod & tcod.event.Modifier.SHIFT and mod & tcod.event.Modifier.CTRL  # Check if Shift+Control is held.
+        <Modifier.NONE: 0>
+
+    .. versionadded:: 12.3
+    """
+
+    NONE = 0
+    LSHIFT = 1
+    """Left shift."""
+    RSHIFT = 2
+    """Right shift."""
+    SHIFT = LSHIFT | RSHIFT
+    """LSHIFT | RSHIFT"""
+    LCTRL = 64
+    """Left control."""
+    RCTRL = 128
+    """Right control."""
+    CTRL = LCTRL | RCTRL
+    """LCTRL | RCTRL"""
+    LALT = 256
+    """Left alt."""
+    RALT = 512
+    """Right alt."""
+    ALT = LALT | RALT
+    """LALT | RALT"""
+    LGUI = 1024
+    """Left meta key."""
+    RGUI = 2048
+    """Right meta key."""
+    GUI = LGUI | RGUI
+    """LGUI | RGUI"""
+    NUM = 4096
+    """Numpad lock."""
+    CAPS = 8192
+    """Caps lock."""
+    MODE = 16384
+    """Alt graph."""
+
+
+class MouseButton(enum.IntEnum):
+    """An enum for mouse buttons.
+
+    .. versionadded:: 16.1
+    """
+
+    LEFT = 1
+    """Left mouse button."""
+    MIDDLE = 2
+    """Middle mouse button."""
+    RIGHT = 3
+    """Right mouse button."""
+    X1 = 4
+    """Back mouse button."""
+    X2 = 5
+    """Forward mouse button."""
+
+    def __repr__(self) -> str:
+        """Return the enum name, excluding the value."""
+        return f"{self.__class__.__name__}.{self.name}"
+
+
+class MouseButtonMask(enum.IntFlag):
+    """A mask enum for held mouse buttons.
+
+    .. versionadded:: 16.1
+    """
+
+    LEFT = 0x1
+    """Left mouse button is held."""
+    MIDDLE = 0x2
+    """Middle mouse button is held."""
+    RIGHT = 0x4
+    """Right mouse button is held."""
+    X1 = 0x8
+    """Back mouse button is held."""
+    X2 = 0x10
+    """Forward mouse button is held."""
+
+    def __repr__(self) -> str:
+        """Return the bitwise OR flag combination of this value."""
+        if self.value == 0:
+            return f"{self.__class__.__name__}(0)"
+        return "|".join(f"{self.__class__.__name__}.{self.__class__(bit).name}" for bit in self.__class__ if bit & self)
+
+
+class _CommonSDLEventAttributes(TypedDict):
+    """Common keywords for Event subclasses."""
+
+    sdl_event: _C_SDL_Event
+    timestamp_ns: int
+
+
+def _unpack_sdl_event(sdl_event: _C_SDL_Event) -> _CommonSDLEventAttributes:
+    """Unpack an SDL_Event union into common attributes, such as timestamp."""
+    return {
+        "sdl_event": sdl_event,
+        "timestamp_ns": sdl_event.common.timestamp,
+    }
+
+
+@attrs.define(slots=True, kw_only=True)
+class Event:
+    """The base event class."""
+
+    sdl_event: _C_SDL_Event = attrs.field(default=None, eq=False, repr=False)
+    """Holds a python-cffi ``SDL_Event*`` pointer for this event when available."""
+
+    timestamp_ns: int = attrs.field(default=0, eq=False)
+    """The time of this event in nanoseconds since SDL has been initialized.
+
+    .. seealso::
+        :any:`tcod.event.time_ns`
+
+    .. versionadded:: 21.0
+    """
+
+    @property
+    def timestamp(self) -> float:
+        """The time of this event in seconds since SDL has been initialized.
+
+        .. seealso::
+            :any:`tcod.event.time`
+
+        .. versionadded:: 21.0
+        """
+        return self.timestamp_ns / 1_000_000_000
+
+    @property
+    @deprecated("The Event.type attribute is deprecated, use isinstance instead.")
+    def type(self) -> str:
+        """This events type.
+
+        .. deprecated:: 21.0
+            Using this attribute is now actively discouraged. Use :func:`isinstance` or :ref:`match`.
+
+        :meta private:
+        """
+        type_override: str | None = getattr(self, "_type", None)
+        if type_override is not None:
+            return type_override
+        return self.__class__.__name__.upper()
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Event:
+        """Return a class instance from a python-cffi 'SDL_Event*' pointer.
+
+        .. versionchanged:: 21.0
+            This method was unsuitable for the public API and is now private.
+        """
+        raise NotImplementedError
+
+
+@attrs.define(slots=True, kw_only=True)
+class Quit(Event):
+    """An application quit request event.
+
+    For more info on when this event is triggered see:
+    https://wiki.libsdl.org/SDL_EventType#SDL_QUIT
+    """
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        return cls(**_unpack_sdl_event(sdl_event))
+
+
+@attrs.define(slots=True, kw_only=True)
+class KeyboardEvent(Event):
+    """Base keyboard event.
+
+    .. versionchanged:: 12.5
+        `scancode`, `sym`, and `mod` now use their respective enums.
+    """
+
+    scancode: Scancode
+    """The keyboard scan-code, this is the physical location
+                        of the key on the keyboard rather than the keys symbol."""
+    sym: KeySym
+    """The keyboard symbol."""
+    mod: Modifier
+    """A bitmask of the currently held modifier keys.
+
+        For example, if shift is held then
+        ``event.mod & tcod.event.Modifier.SHIFT`` will evaluate to a true
+        value.
+    """
+    repeat: bool = False
+    """True if this event exists because of key repeat."""
+    which: int = 0
+    """The SDL keyboard instance ID. Zero if unknown or virtual.
+
+    .. versionadded:: 21.0
+    """
+    window_id: int = 0
+    """The SDL window ID with keyboard focus.
+
+    .. versionadded:: 21.0
+    """
+    pressed: bool = False
+    """True if the key was pressed, False if the key was released.
+
+    .. versionadded:: 21.0
+    """
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        keysym = sdl_event.key
+        return cls(
+            scancode=Scancode(keysym.scancode),
+            sym=KeySym(keysym.key),
+            mod=Modifier(keysym.mod),
+            repeat=bool(keysym.repeat),
+            pressed=bool(keysym.down),
+            which=int(keysym.which),
+            window_id=int(keysym.windowID),
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+@attrs.define(slots=True, kw_only=True)
+class KeyDown(KeyboardEvent):
+    """A :any:`KeyboardEvent` where the key was pressed."""
+
+
+@attrs.define(slots=True, kw_only=True)
+class KeyUp(KeyboardEvent):
+    """A :any:`KeyboardEvent` where the key was released."""
+
+
+@attrs.define(slots=True, kw_only=True)
+class MouseState(Event):
+    """Mouse state.
+
+    .. versionadded:: 9.3
+
+    .. versionchanged:: 15.0
+        Renamed `pixel` attribute to `position`.
+    """
+
+    position: Point[float] = attrs.field(default=Point(0.0, 0.0))
+    """The position coordinates of the mouse."""
+    _tile: Point[int] | None = attrs.field(default=Point(0, 0), alias="tile")
+
+    state: MouseButtonMask = attrs.field(default=MouseButtonMask(0))
+    """A bitmask of which mouse buttons are currently held."""
+
+    which: int = 0
+    """The mouse device ID for this event.
+
+    .. versionadded:: 21.0
+    """
+
+    window_id: int = 0
+    """The window ID with mouse focus.
+
+    .. versionadded:: 21.0
+    """
+
+    @property
+    def integer_position(self) -> Point[int]:
+        """Integer coordinates of this event.
+
+        .. versionadded:: 21.0
+        """
+        x, y = self.position
+        return Point(floor(x), floor(y))
+
+    @property
+    @deprecated("The mouse.pixel attribute is deprecated.  Use mouse.position instead.")
+    def pixel(self) -> Point[float]:  # noqa: D102 # Skip docstring for deprecated attribute
+        return self.position
+
+    @pixel.setter
+    def pixel(self, value: Point[float]) -> None:
+        self.position = value
+
+    @property
+    @deprecated(
+        "The mouse.tile attribute is deprecated."
+        "  Use mouse.integer_position of the event returned by context.convert_event instead."
+    )
+    def tile(self) -> Point[int]:
+        """The integer tile coordinates of the mouse on the screen.
+
+        .. deprecated:: 21.0
+            Use :any:`integer_position` of the event returned by :any:`Context.convert_event` instead.
+        """
+        return _verify_tile_coordinates(self._tile)
+
+    @tile.setter
+    @deprecated(
+        "The mouse.tile attribute is deprecated."
+        "  Use mouse.integer_position of the event returned by context.convert_event instead."
+    )
+    def tile(self, xy: tuple[int, int]) -> None:
+        self._tile = Point(*xy)
+
+
+@attrs.define(slots=True, kw_only=True)
+class MouseMotion(MouseState):
+    """Mouse motion event.
+
+    .. versionchanged:: 15.0
+        Renamed `pixel` attribute to `position`.
+        Renamed `pixel_motion` attribute to `motion`.
+
+    .. versionchanged:: 19.0
+        `position` and `motion` now use floating point coordinates.
+    """
+
+    motion: Point[float] = attrs.field(default=Point(0.0, 0.0))
+    """The pixel delta."""
+    _tile_motion: Point[int] | None = attrs.field(default=Point(0, 0), alias="tile_motion")
+
+    @property
+    def integer_motion(self) -> Point[int]:
+        """Integer motion of this event.
+
+        .. versionadded:: 21.0
+        """
+        x, y = self.position
+        dx, dy = self.motion
+        prev_x, prev_y = x - dx, y - dy
+        return Point(floor(x) - floor(prev_x), floor(y) - floor(prev_y))
+
+    @property
+    @deprecated("The mouse.pixel_motion attribute is deprecated.  Use mouse.motion instead.")
+    def pixel_motion(self) -> Point[float]:  # noqa: D102 # Skip docstring for deprecated attribute
+        return self.motion
+
+    @pixel_motion.setter
+    @deprecated("The mouse.pixel_motion attribute is deprecated.  Use mouse.motion instead.")
+    def pixel_motion(self, value: Point[float]) -> None:
+        self.motion = value
+
+    @property
+    @deprecated(
+        "The mouse.tile_motion attribute is deprecated."
+        "  Use mouse.integer_motion of the event returned by context.convert_event instead."
+    )
+    def tile_motion(self) -> Point[int]:
+        """The tile delta.
+
+        .. deprecated:: 21.0
+            Use :any:`integer_motion` of the event returned by :any:`Context.convert_event` instead.
+        """
+        return _verify_tile_coordinates(self._tile_motion)
+
+    @tile_motion.setter
+    @deprecated(
+        "The mouse.tile_motion attribute is deprecated."
+        "  Use mouse.integer_motion of the event returned by context.convert_event instead."
+    )
+    def tile_motion(self, xy: tuple[int, int]) -> None:
+        self._tile_motion = Point(*xy)
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        motion = sdl_event.motion
+        common = {"which": int(motion.which), "window_id": int(motion.windowID)}
+        state = MouseButtonMask(motion.state)
+
+        pixel = Point(float(motion.x), float(motion.y))
+        pixel_motion = Point(float(motion.xrel), float(motion.yrel))
+        subtile = _pixel_to_tile(pixel)
+        if subtile is None:
+            self = cls(
+                position=pixel,
+                motion=pixel_motion,
+                tile=None,
+                tile_motion=None,
+                state=state,
+                **common,
+                **_unpack_sdl_event(sdl_event),
+            )
+        else:
+            tile = Point(floor(subtile[0]), floor(subtile[1]))
+            prev_pixel = (pixel[0] - pixel_motion[0], pixel[1] - pixel_motion[1])
+            prev_subtile = _pixel_to_tile(prev_pixel) or (0, 0)
+            prev_tile = floor(prev_subtile[0]), floor(prev_subtile[1])
+            tile_motion = Point(tile[0] - prev_tile[0], tile[1] - prev_tile[1])
+            self = cls(
+                position=pixel,
+                motion=pixel_motion,
+                tile=tile,
+                tile_motion=tile_motion,
+                state=state,
+                **common,
+                **_unpack_sdl_event(sdl_event),
+            )
+        self.sdl_event = sdl_event
+        return self
+
+
+@attrs.define(slots=True, kw_only=True)
+class MouseButtonEvent(Event):
+    """Mouse button event.
+
+    .. versionchanged:: 19.0
+        `position` and `tile` now use floating point coordinates.
+
+    .. versionchanged:: 21.0
+        No longer a subclass of :any:`MouseState`.
+    """
+
+    position: Point[float] = attrs.field(default=Point(0.0, 0.0))
+    """The coordinates of the mouse."""
+    _tile: Point[int] | None = attrs.field(default=Point(0, 0), alias="tile")
+    """The tile integer coordinates of the mouse on the screen. Deprecated."""
+    button: MouseButton
+    """Which mouse button index was pressed or released in this event.
+
+    .. versionchanged:: 21.0
+        Is now strictly a :any:`MouseButton` type.
+    """
+
+    which: int = 0
+    """The mouse device ID for this event.
+
+    .. versionadded:: 21.0
+    """
+
+    window_id: int = 0
+    """The window ID with mouse focus.
+
+    .. versionadded:: 21.0
+    """
+
+    @property
+    def integer_position(self) -> Point[int]:
+        """Integer coordinates of this event.
+
+        .. versionadded:: 21.1
+        """
+        x, y = self.position
+        return Point(floor(x), floor(y))
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        button = sdl_event.button
+        pixel = Point(float(button.x), float(button.y))
+        subtile = _pixel_to_tile(pixel)
+        if subtile is None:
+            tile: Point[int] | None = None
+        else:
+            tile = Point(floor(subtile[0]), floor(subtile[1]))
+        self = cls(
+            position=pixel,
+            tile=tile,
+            button=MouseButton(button.button),
+            which=int(button.which),
+            window_id=int(button.windowID),
+            **_unpack_sdl_event(sdl_event),
+        )
+        self.sdl_event = sdl_event
+        return self
+
+    @property
+    @deprecated(
+        "This attribute is for mouse state and mouse motion only. Use `event.button` instead.", category=FutureWarning
+    )
+    def state(self) -> int:  # noqa: D102 # Skip docstring for deprecated property
+        return int(self.button)
+
+
+@attrs.define(slots=True, kw_only=True)
+class MouseButtonDown(MouseButtonEvent):
+    """Mouse button has been pressed."""
+
+
+@attrs.define(slots=True, kw_only=True)
+class MouseButtonUp(MouseButtonEvent):
+    """Mouse button has been released."""
+
+
+@attrs.define(slots=True, kw_only=True)
+class MouseWheel(Event):
+    """Mouse wheel event."""
+
+    x: int
+    """Horizontal scrolling. A positive value means scrolling right."""
+    y: int
+    """Vertical scrolling. A positive value means scrolling away from the user."""
+    flipped: bool
+    """If True then the values of `x` and `y` are the opposite of their usual values.
+    This depends on the operating system settings.
+    """
+
+    position: Point[float] = attrs.field(default=Point(0.0, 0.0))
+    """Coordinates of the mouse for this event.
+
+    .. versionadded:: 21.2
+    """
+
+    which: int = 0
+    """Mouse device ID for this event.
+
+    .. versionadded:: 21.2
+    """
+
+    window_id: int = 0
+    """Window ID with mouse focus.
+
+    .. versionadded:: 21.2
+    """
+
+    @property
+    def integer_position(self) -> Point[int]:
+        """Integer coordinates of this event.
+
+        .. versionadded:: 21.2
+        """
+        x, y = self.position
+        return Point(floor(x), floor(y))
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        wheel = sdl_event.wheel
+        return cls(
+            x=int(wheel.integer_x),
+            y=int(wheel.integer_y),
+            flipped=bool(wheel.direction),
+            position=Point(float(wheel.mouse_x), float(wheel.mouse_y)),
+            which=int(wheel.which),
+            window_id=int(wheel.windowID),
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+@runtime_checkable
+class _MouseEventWithPosition(Protocol):
+    """Mouse event with position. Used internally to handle conversions."""
+
+    position: Point[float]
+
+
+@runtime_checkable
+class _MouseEventWithTile(Protocol):
+    """Mouse event with position and deprecated tile attribute. Used internally to handle conversions."""
+
+    position: Point[float]
+    _tile: Point[int] | None
+
+
+@attrs.define(slots=True, kw_only=True)
+class TextInput(Event):
+    """SDL text input event.
+
+    .. warning::
+        These events are not enabled by default since `19.0`.
+
+        Use :any:`Window.start_text_input` to enable this event.
+    """
+
+    text: str
+    """A Unicode string with the input."""
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        return cls(text=str(ffi.string(sdl_event.text.text, 32), encoding="utf8"), **_unpack_sdl_event(sdl_event))
+
+
+_WindowTypes = Literal[
+    "WindowShown",
+    "WindowHidden",
+    "WindowExposed",
+    "WindowMoved",
+    "WindowResized",
+    "PixelSizeChanged",
+    "MetalViewResized",
+    "WindowMinimized",
+    "WindowMaximized",
+    "WindowRestored",
+    "WindowEnter",
+    "WindowLeave",
+    "WindowFocusGained",
+    "WindowFocusLost",
+    "WindowClose",
+    "WindowTakeFocus",
+    "WindowHitTest",
+    "ICCProfileChanged",
+    "DisplayChanged",
+    "DisplayScaleChanged",
+    "SafeAreaChanged",
+    "Occluded",
+    "EnterFullscreen",
+    "LeaveFullscreen",
+    "Destroyed",
+    "HDRStateChanged",
+]
+
+
+@attrs.define(slots=True, kw_only=True)
+class WindowEvent(Event):
+    """A window event.
+
+    Example::
+
+        match event:
+            case tcod.event.WindowEvent(type="WindowShown", window_id=window_id):
+                print(f"Window {window_id} was shown")
+            case tcod.event.WindowEvent(type="WindowHidden", window_id=window_id):
+                print(f"Window {window_id} was hidden")
+            case tcod.event.WindowEvent(type="WindowExposed", window_id=window_id):
+                print(f"Window {window_id} was exposed and needs to be redrawn")
+            case tcod.event.WindowEvent(type="WindowMoved", data=(x, y), window_id=window_id):
+                print(f"Window {window_id} was moved to {x=},{y=}")
+            case tcod.event.WindowEvent(type="WindowResized", data=(width, height), window_id=window_id):
+                print(f"Window {window_id} was resized to {width=},{height=}")
+            case tcod.event.WindowEvent(type="WindowMinimized", window_id=window_id):
+                print(f"Window {window_id} was minimized")
+            case tcod.event.WindowEvent(type="WindowMaximized", window_id=window_id):
+                print(f"Window {window_id} was maximized")
+            case tcod.event.WindowEvent(type="WindowRestored", window_id=window_id):
+                print(f"Window {window_id} was restored")
+            case tcod.event.WindowEvent(type="WindowEnter", window_id=window_id):
+                print(f"Mouse cursor has entered window {window_id}")
+            case tcod.event.WindowEvent(type="WindowLeave", window_id=window_id):
+                print(f"Mouse cursor has left window {window_id}")
+            case tcod.event.WindowEvent(type="WindowFocusGained", window_id=window_id):
+                print(f"Window {window_id} has gained keyboard focus")
+            case tcod.event.WindowEvent(type="WindowFocusLost", window_id=window_id):
+                print(f"Window {window_id} has lost keyboard focus")
+            case tcod.event.WindowEvent(type="WindowClose", window_id=window_id):
+                print(f"Window {window_id} has been closed")
+            case tcod.event.WindowEvent(type="DisplayChanged", data=(display_id, _), window_id=window_id):
+                print(f"Window {window_id} has been moved to display {display_id}")
+            case tcod.event.WindowEvent(type=subtype, data=data, window_id=window_id):
+                print(f"Other window event {subtype} on window {window_id} with {data=}")
+
+    .. versionchanged:: 21.0
+        Added `data` and `window_id` attributes and added missing SDL3 window events.
+    """
+
+    type: Final[_WindowTypes]
+    """The current window event. This can be one of various options."""
+
+    window_id: int
+    """The SDL window ID associated with this event."""
+
+    data: tuple[int, int]
+    """The SDL data associated with this event. What these values are for depends on the event sub-type."""
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> WindowEvent | Undefined:
+        if sdl_event.type not in _WINDOW_TYPES_FROM_ENUM:
+            return Undefined._from_sdl_event(sdl_event)
+        event_type: Final = _WINDOW_TYPES_FROM_ENUM[sdl_event.type]
+        new_cls = cls
+        if sdl_event.type == lib.SDL_EVENT_WINDOW_MOVED:
+            new_cls = WindowMoved
+        elif sdl_event.type == lib.SDL_EVENT_WINDOW_RESIZED:
+            new_cls = WindowResized
+        return new_cls(
+            type=event_type,
+            window_id=int(sdl_event.window.windowID),
+            data=(int(sdl_event.window.data1), int(sdl_event.window.data2)),
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+_WINDOW_TYPES_FROM_ENUM: Final[dict[int, _WindowTypes]] = {
+    lib.SDL_EVENT_WINDOW_SHOWN: "WindowShown",
+    lib.SDL_EVENT_WINDOW_HIDDEN: "WindowHidden",
+    lib.SDL_EVENT_WINDOW_EXPOSED: "WindowExposed",
+    lib.SDL_EVENT_WINDOW_MOVED: "WindowMoved",
+    lib.SDL_EVENT_WINDOW_RESIZED: "WindowResized",
+    lib.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: "PixelSizeChanged",
+    lib.SDL_EVENT_WINDOW_METAL_VIEW_RESIZED: "MetalViewResized",
+    lib.SDL_EVENT_WINDOW_MINIMIZED: "WindowMinimized",
+    lib.SDL_EVENT_WINDOW_MAXIMIZED: "WindowMaximized",
+    lib.SDL_EVENT_WINDOW_RESTORED: "WindowRestored",
+    lib.SDL_EVENT_WINDOW_MOUSE_ENTER: "WindowEnter",
+    lib.SDL_EVENT_WINDOW_MOUSE_LEAVE: "WindowLeave",
+    lib.SDL_EVENT_WINDOW_FOCUS_GAINED: "WindowFocusGained",
+    lib.SDL_EVENT_WINDOW_FOCUS_LOST: "WindowFocusLost",
+    lib.SDL_EVENT_WINDOW_CLOSE_REQUESTED: "WindowClose",
+    lib.SDL_EVENT_WINDOW_HIT_TEST: "WindowHitTest",
+    lib.SDL_EVENT_WINDOW_ICCPROF_CHANGED: "ICCProfileChanged",
+    lib.SDL_EVENT_WINDOW_DISPLAY_CHANGED: "DisplayChanged",
+    lib.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: "DisplayScaleChanged",
+    lib.SDL_EVENT_WINDOW_SAFE_AREA_CHANGED: "SafeAreaChanged",
+    lib.SDL_EVENT_WINDOW_OCCLUDED: "Occluded",
+    lib.SDL_EVENT_WINDOW_ENTER_FULLSCREEN: "EnterFullscreen",
+    lib.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN: "LeaveFullscreen",
+    lib.SDL_EVENT_WINDOW_DESTROYED: "Destroyed",
+    lib.SDL_EVENT_WINDOW_HDR_STATE_CHANGED: "HDRStateChanged",
+}
+
+
+@attrs.define(slots=True, kw_only=True)
+class WindowMoved(WindowEvent):
+    """Window moved event."""
+
+    @property
+    def x(self) -> int:
+        """Movement on the x-axis."""
+        return self.data[0]
+
+    @property
+    def y(self) -> int:
+        """Movement on the y-axis."""
+        return self.data[1]
+
+
+@attrs.define(slots=True, kw_only=True)
+class WindowResized(WindowEvent):
+    """Window resized event.
+
+    .. versionchanged:: 19.4
+        Removed "WindowSizeChanged" type.
+    """
+
+    @property
+    def width(self) -> int:
+        """The current width of the window."""
+        return self.data[0]
+
+    @property
+    def height(self) -> int:
+        """The current height of the window."""
+        return self.data[1]
+
+
+@attrs.define(slots=True, kw_only=True)
+class JoystickEvent(Event):
+    """A base class for joystick events.
+
+    .. versionadded:: 13.8
+    """
+
+    which: int
+    """The ID of the joystick this event is for."""
+
+    @property
+    def joystick(self) -> tcod.sdl.joystick.Joystick:
+        """The :any:`Joystick` for this event."""
+        if isinstance(self, JoystickDevice) and self.type == "JOYDEVICEADDED":
+            return tcod.sdl.joystick.Joystick._open(self.which)
+        return tcod.sdl.joystick.Joystick._from_instance_id(self.which)
+
+
+@attrs.define(slots=True, kw_only=True)
+class JoystickAxis(JoystickEvent):
+    """When a joystick axis changes in value.
+
+    .. versionadded:: 13.8
+
+    .. seealso::
+        :any:`tcod.sdl.joystick`
+    """
+
+    _type: Final[Literal["JOYAXISMOTION"]] = "JOYAXISMOTION"
+
+    axis: int
+    """The index of the changed axis."""
+    value: int
+    """The raw value of the axis in the range -32768 to 32767."""
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        return cls(
+            which=int(sdl_event.jaxis.which),
+            axis=int(sdl_event.jaxis.axis),
+            value=int(sdl_event.jaxis.value),
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+@attrs.define(slots=True, kw_only=True)
+class JoystickBall(JoystickEvent):
+    """When a joystick ball is moved.
+
+    .. versionadded:: 13.8
+
+    .. seealso::
+        :any:`tcod.sdl.joystick`
+    """
+
+    _type: Final[Literal["JOYBALLMOTION"]] = "JOYBALLMOTION"
+
+    ball: int
+    """The index of the moved ball."""
+    dx: int
+    """The X motion of the ball."""
+    dy: int
+    """The Y motion of the ball."""
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        return cls(
+            which=int(sdl_event.jball.which),
+            ball=int(sdl_event.jball.ball),
+            dx=int(sdl_event.jball.xrel),
+            dy=int(sdl_event.jball.yrel),
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+@attrs.define(slots=True, kw_only=True)
+class JoystickHat(JoystickEvent):
+    """When a joystick hat changes direction.
+
+    .. versionadded:: 13.8
+
+    .. seealso::
+        :any:`tcod.sdl.joystick`
+    """
+
+    _type: Final[Literal["JOYHATMOTION"]] = "JOYHATMOTION"
+
+    x: Literal[-1, 0, 1]
+    """The new X direction of the hat."""
+    y: Literal[-1, 0, 1]
+    """The new Y direction of the hat."""
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        x, y = _HAT_DIRECTIONS[sdl_event.jhat.hat]
+        return cls(which=int(sdl_event.jhat.which), x=x, y=y, **_unpack_sdl_event(sdl_event))
+
+
+@attrs.define(slots=True, kw_only=True)
+class JoystickButton(JoystickEvent):
+    """When a joystick button is pressed or released.
+
+    .. versionadded:: 13.8
+
+    Example::
+
+        for event in tcod.event.get():
+            match event:
+                case JoystickButton(which=which, button=button, pressed=True):
+                    print(f"Pressed {button=} on controller {which}.")
+                case JoystickButton(which=which, button=button, pressed=False):
+                    print(f"Released {button=} on controller {which}.")
+    """
+
+    button: int
+    """The index of the button this event is for."""
+    pressed: bool
+    """True if the button was pressed, False if the button was released."""
+
+    @property
+    @deprecated("Check 'JoystickButton.pressed' instead of '.type'.")
+    def type(self) -> Literal["JOYBUTTONUP", "JOYBUTTONDOWN"]:
+        """Button state as a string.
+
+        .. deprecated:: 21.0
+            Use :any:`pressed` instead.
+        """
+        return ("JOYBUTTONUP", "JOYBUTTONDOWN")[self.pressed]
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        return cls(
+            which=int(sdl_event.jbutton.which),
+            button=int(sdl_event.jbutton.button),
+            pressed=bool(sdl_event.jbutton.down),
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+@attrs.define(slots=True, kw_only=True)
+class JoystickDevice(JoystickEvent):
+    """An event for when a joystick is added or removed.
+
+    .. versionadded:: 13.8
+
+    Example::
+
+        joysticks: set[tcod.sdl.joystick.Joystick] = {}
+        for event in tcod.event.get():
+            match event:
+                case tcod.event.JoystickDevice(type="JOYDEVICEADDED", joystick=new_joystick):
+                    joysticks.add(new_joystick)
+                case tcod.event.JoystickDevice(type="JOYDEVICEREMOVED", joystick=joystick):
+                    joysticks.remove(joystick)
+    """
+
+    type: Final[Literal["JOYDEVICEADDED", "JOYDEVICEREMOVED"]]
+
+    which: int
+    """When type="JOYDEVICEADDED" this is the device ID.
+    When type="JOYDEVICEREMOVED" this is the instance ID.
+    """
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        types: Final[dict[int, Literal["JOYDEVICEADDED", "JOYDEVICEREMOVED"]]] = {
+            lib.SDL_EVENT_JOYSTICK_ADDED: "JOYDEVICEADDED",
+            lib.SDL_EVENT_JOYSTICK_REMOVED: "JOYDEVICEREMOVED",
+        }
+        return cls(type=types[sdl_event.type], which=int(sdl_event.jdevice.which), **_unpack_sdl_event(sdl_event))
+
+
+@attrs.define(slots=True, kw_only=True)
+class ControllerEvent(Event):
+    """Base class for controller events.
+
+    .. versionadded:: 13.8
+    """
+
+    which: int
+    """The ID of the controller this event is for."""
+
+    @property
+    def controller(self) -> tcod.sdl.joystick.GameController:
+        """The :any:`GameController` for this event."""
+        if isinstance(self, ControllerDevice) and self.type == "CONTROLLERDEVICEADDED":
+            return tcod.sdl.joystick.GameController._open(self.which)
+        return tcod.sdl.joystick.GameController._from_instance_id(self.which)
+
+
+@attrs.define(slots=True, kw_only=True)
+class ControllerAxis(ControllerEvent):
+    """When a controller axis is moved.
+
+    .. versionadded:: 13.8
+    """
+
+    _type: Final[Literal["CONTROLLERAXISMOTION"]] = "CONTROLLERAXISMOTION"
+
+    axis: int
+    """Which axis is being moved.  One of :any:`ControllerAxis`."""
+    value: int
+    """The new value of this events axis.
+
+    This will be -32768 to 32767 for all axes except for triggers which are 0 to 32767 instead."""
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        return cls(
+            which=int(sdl_event.gaxis.which),
+            axis=tcod.sdl.joystick.ControllerAxis(sdl_event.gaxis.axis),
+            value=int(sdl_event.gaxis.value),
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+@attrs.define(slots=True, kw_only=True)
+class ControllerButton(ControllerEvent):
+    """When a controller button is pressed or released.
+
+    .. versionadded:: 13.8
+    """
+
+    button: tcod.sdl.joystick.ControllerButton
+    """The button for this event.  One of :any:`ControllerButton`."""
+    pressed: bool
+    """True if the button was pressed, False if it was released."""
+
+    @property
+    @deprecated("Check 'ControllerButton.pressed' instead of '.type'.")
+    def type(self) -> Literal["CONTROLLERBUTTONUP", "CONTROLLERBUTTONDOWN"]:
+        """Button state as a string.
+
+        .. deprecated:: 21.0
+            Use :any:`pressed` instead.
+        """
+        return ("CONTROLLERBUTTONUP", "CONTROLLERBUTTONDOWN")[self.pressed]
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        return cls(
+            which=int(sdl_event.gbutton.which),
+            button=tcod.sdl.joystick.ControllerButton(sdl_event.gbutton.button),
+            pressed=bool(sdl_event.gbutton.down),
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+@attrs.define(slots=True, kw_only=True)
+class ControllerDevice(ControllerEvent):
+    """When a controller is added, removed, or remapped.
+
+    .. versionadded:: 13.8
+    """
+
+    type: Final[Literal["CONTROLLERDEVICEADDED", "CONTROLLERDEVICEREMOVED", "CONTROLLERDEVICEREMAPPED"]]
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        types: dict[int, Literal["CONTROLLERDEVICEADDED", "CONTROLLERDEVICEREMOVED", "CONTROLLERDEVICEREMAPPED"]] = {
+            lib.SDL_EVENT_GAMEPAD_ADDED: "CONTROLLERDEVICEADDED",
+            lib.SDL_EVENT_GAMEPAD_REMOVED: "CONTROLLERDEVICEREMOVED",
+            lib.SDL_EVENT_GAMEPAD_REMAPPED: "CONTROLLERDEVICEREMAPPED",
+        }
+        return cls(type=types[sdl_event.type], which=int(sdl_event.gdevice.which), **_unpack_sdl_event(sdl_event))
+
+
+@attrs.define(slots=True, kw_only=True)
+class ClipboardUpdate(Event):
+    """Announces changed contents of the clipboard.
+
+    .. versionadded:: 21.0
+    """
+
+    mime_types: tuple[str, ...]
+    """The MIME types of the clipboard."""
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        return cls(
+            mime_types=tuple(
+                str(ffi.string(sdl_event.clipboard.mime_types[i]), encoding="utf8")
+                for i in range(sdl_event.clipboard.num_mime_types)
+            ),
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+@attrs.define(slots=True, kw_only=True)
+class Drop(Event):
+    """Handle dropping text or files on the window.
+
+    Example::
+
+        match event:
+            case tcod.event.Drop(type="BEGIN"):
+                print("Object dragged over the window")
+            case tcod.event.Drop(type="POSITION", position=position):
+                pass
+            case tcod.event.Drop(type="TEXT", position=position, text=text):
+                print(f"Dropped {text=} at {position=}")
+            case tcod.event.Drop(type="FILE", position=position, path=path):
+                print(f"Dropped {path=} at {position=}")
+            case tcod.event.Drop(type="COMPLETE"):
+                print("Drop handling finished")
+
+    .. versionadded:: 21.0
+    """
+
+    type: Literal["BEGIN", "FILE", "TEXT", "COMPLETE", "POSITION"]
+    """The subtype of this event."""
+    window_id: int
+    """The active window ID for this event."""
+    position: Point[float]
+    """Mouse position relative to the window. Available in all subtypes except for ``type="BEGIN"``."""
+    source: str
+    """The source app for this event, or an empty string if unavailable."""
+    text: str
+    """The dropped data of a ``Drop(type="TEXT")`` or ``Drop(type="FILE")`` event.
+
+    - If ``Drop(type="TEXT")`` then `text` is the dropped string.
+    - If ``Drop(type="FILE")`` then `text` is the str path of the dropped file.
+      Alternatively :any:`path` can be used.
+    - Otherwise `text` is an empty string.
+    """
+
+    @property
+    def path(self) -> Path:
+        """Return the current `text` as a :any:`Path`."""
+        return Path(self.text)
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        types: dict[int, Literal["BEGIN", "FILE", "TEXT", "COMPLETE", "POSITION"]] = {
+            lib.SDL_EVENT_DROP_BEGIN: "BEGIN",
+            lib.SDL_EVENT_DROP_FILE: "FILE",
+            lib.SDL_EVENT_DROP_TEXT: "TEXT",
+            lib.SDL_EVENT_DROP_COMPLETE: "COMPLETE",
+            lib.SDL_EVENT_DROP_POSITION: "POSITION",
+        }
+        return cls(
+            type=types[sdl_event.drop.type],
+            window_id=int(sdl_event.drop.windowID),
+            position=Point(float(sdl_event.drop.x), float(sdl_event.drop.y)),
+            source=str(ffi.string(sdl_event.drop.source), encoding="utf8") if sdl_event.drop.source else "",
+            text=str(ffi.string(sdl_event.drop.data), encoding="utf8") if sdl_event.drop.data else "",
+            **_unpack_sdl_event(sdl_event),
+        )
+
+
+@functools.cache
+def _find_event_name(index: int, /) -> str:
+    """Return the SDL event name for this index."""
+    for attr in dir(lib):
+        if attr.startswith("SDL_EVENT_") and getattr(lib, attr) == index:
+            return attr
+    return "???"
+
+
+@attrs.define(slots=True, kw_only=True)
+class Undefined(Event):
+    """This class is a place holder for SDL events without their own tcod.event class."""
+
+    @classmethod
+    def _from_sdl_event(cls, sdl_event: _C_SDL_Event) -> Self:
+        return cls(**_unpack_sdl_event(sdl_event))
+
+    def __repr__(self) -> str:
+        """Return debug info for this undefined event, including the SDL event name."""
+        return f"<Undefined sdl_event.type={self.sdl_event.type} {_find_event_name(self.sdl_event.type)}>"
+
+
+_SDL_TO_CLASS_TABLE: dict[int, type[Event]] = {
+    lib.SDL_EVENT_QUIT: Quit,
+    lib.SDL_EVENT_KEY_DOWN: KeyDown,
+    lib.SDL_EVENT_KEY_UP: KeyUp,
+    lib.SDL_EVENT_MOUSE_MOTION: MouseMotion,
+    lib.SDL_EVENT_MOUSE_BUTTON_DOWN: MouseButtonDown,
+    lib.SDL_EVENT_MOUSE_BUTTON_UP: MouseButtonUp,
+    lib.SDL_EVENT_MOUSE_WHEEL: MouseWheel,
+    lib.SDL_EVENT_TEXT_INPUT: TextInput,
+    lib.SDL_EVENT_JOYSTICK_AXIS_MOTION: JoystickAxis,
+    lib.SDL_EVENT_JOYSTICK_BALL_MOTION: JoystickBall,
+    lib.SDL_EVENT_JOYSTICK_HAT_MOTION: JoystickHat,
+    lib.SDL_EVENT_JOYSTICK_BUTTON_DOWN: JoystickButton,
+    lib.SDL_EVENT_JOYSTICK_BUTTON_UP: JoystickButton,
+    lib.SDL_EVENT_JOYSTICK_ADDED: JoystickDevice,
+    lib.SDL_EVENT_JOYSTICK_REMOVED: JoystickDevice,
+    lib.SDL_EVENT_GAMEPAD_AXIS_MOTION: ControllerAxis,
+    lib.SDL_EVENT_GAMEPAD_BUTTON_DOWN: ControllerButton,
+    lib.SDL_EVENT_GAMEPAD_BUTTON_UP: ControllerButton,
+    lib.SDL_EVENT_GAMEPAD_ADDED: ControllerDevice,
+    lib.SDL_EVENT_GAMEPAD_REMOVED: ControllerDevice,
+    lib.SDL_EVENT_GAMEPAD_REMAPPED: ControllerDevice,
+    lib.SDL_EVENT_CLIPBOARD_UPDATE: ClipboardUpdate,
+    lib.SDL_EVENT_DROP_BEGIN: Drop,
+    lib.SDL_EVENT_DROP_FILE: Drop,
+    lib.SDL_EVENT_DROP_TEXT: Drop,
+    lib.SDL_EVENT_DROP_COMPLETE: Drop,
+    lib.SDL_EVENT_DROP_POSITION: Drop,
+}
+
+
+def _parse_event(sdl_event: _C_SDL_Event) -> Event:
+    """Convert a C SDL_Event* type into a tcod Event sub-class."""
+    if sdl_event.type in _SDL_TO_CLASS_TABLE:
+        return _SDL_TO_CLASS_TABLE[sdl_event.type]._from_sdl_event(sdl_event)
+    if sdl_event.type in _WINDOW_TYPES_FROM_ENUM:
+        return WindowEvent._from_sdl_event(sdl_event)
+    return Undefined._from_sdl_event(sdl_event)
+
+
+def get() -> Iterator[Event]:
+    """Return an iterator for all pending events.
+
+    Events are processed as the iterator is consumed.
+    Breaking out of, or discarding the iterator will leave the remaining events on the event queue.
+    It is also safe to call this function inside of a loop that is already handling events
+    (the event iterator is reentrant.)
+    """
+    if not lib.SDL_WasInit(tcod.sdl.sys.Subsystem.EVENTS):
+        warnings.warn(
+            "Events polled before SDL was initialized.",
+            RuntimeWarning,
+            stacklevel=1,
+        )
+        return
+    sdl_event = ffi.new("SDL_Event*")
+    while lib.SDL_PollEvent(sdl_event):
+        yield _parse_event(sdl_event)
+
+
+def wait(timeout: float | None = None) -> Iterator[Event]:
+    """Block until events exist, then return an event iterator.
+
+    `timeout` is the maximum number of seconds to wait as a floating point
+    number with millisecond precision, or it can be None to wait forever.
+
+    Returns the same iterator as a call to :any:`tcod.event.get`.
+
+    This function is useful for simple games with little to no animations.
+    The following example sleeps whenever no events are queued:
+
+    Example::
+
+        context: tcod.context.Context  # Context object initialized earlier.
+        while True:  # Main game-loop.
+            console: tcod.console.Console  # Console used for rendering.
+            ...  # Render the frame to `console` and then:
+            context.present(console)  # Show the console to the display.
+            # The ordering to draw first before waiting for events is important.
+            for event in tcod.event.wait():  # Sleeps until the next events exist.
+                ...  # All events are handled at once before the next frame.
+
+    See :any:`tcod.event.get` examples for how different events are handled.
+    """
+    if timeout is not None:
+        lib.SDL_WaitEventTimeout(ffi.NULL, int(timeout * 1000))
+    else:
+        lib.SDL_WaitEvent(ffi.NULL)
+    return get()
+
+
+@deprecated(
+    """EventDispatch is no longer maintained.
+Event dispatching should be handled via a single custom method in a Protocol instead of this class.""",
+    category=DeprecationWarning,
+)
+class EventDispatch(Generic[T]):
+    '''Dispatches events to methods depending on the events type attribute.
+
+    To use this class, make a sub-class and override the relevant `ev_*` methods.
+    Then send events to the dispatch method.
+
+    .. versionchanged:: 11.12
+        This is now a generic class.
+        The type hints at the return value of :any:`dispatch` and the `ev_*` methods.
+
+    .. deprecated:: 18.0
+        Event dispatch should be handled via a single custom method in a :class:`~typing.Protocol` instead of this class.
+        Note that events can and should be handled using :ref:`match`.
+
+    Example::
+
+        import tcod
+
+        MOVE_KEYS = {  # key_symbol: (x, y)
+            # Arrow keys.
+            tcod.event.KeySym.LEFT: (-1, 0),
+            tcod.event.KeySym.RIGHT: (1, 0),
+            tcod.event.KeySym.UP: (0, -1),
+            tcod.event.KeySym.DOWN: (0, 1),
+            tcod.event.KeySym.HOME: (-1, -1),
+            tcod.event.KeySym.END: (-1, 1),
+            tcod.event.KeySym.PAGEUP: (1, -1),
+            tcod.event.KeySym.PAGEDOWN: (1, 1),
+            tcod.event.KeySym.PERIOD: (0, 0),
+            # Numpad keys.
+            tcod.event.KeySym.KP_1: (-1, 1),
+            tcod.event.KeySym.KP_2: (0, 1),
+            tcod.event.KeySym.KP_3: (1, 1),
+            tcod.event.KeySym.KP_4: (-1, 0),
+            tcod.event.KeySym.KP_5: (0, 0),
+            tcod.event.KeySym.KP_6: (1, 0),
+            tcod.event.KeySym.KP_7: (-1, -1),
+            tcod.event.KeySym.KP_8: (0, -1),
+            tcod.event.KeySym.KP_9: (1, -1),
+            tcod.event.KeySym.CLEAR: (0, 0),  # Numpad `clear` key.
+            # Vi Keys.
+            tcod.event.KeySym.h: (-1, 0),
+            tcod.event.KeySym.j: (0, 1),
+            tcod.event.KeySym.k: (0, -1),
+            tcod.event.KeySym.l: (1, 0),
+            tcod.event.KeySym.y: (-1, -1),
+            tcod.event.KeySym.u: (1, -1),
+            tcod.event.KeySym.b: (-1, 1),
+            tcod.event.KeySym.n: (1, 1),
+        }
+
+
+        class State(tcod.event.EventDispatch[None]):
+            """A state-based superclass that converts `events` into `commands`.
+
+            The configuration used to convert events to commands are hard-coded
+            in this example, but could be modified to be user controlled.
+
+            Subclasses will override the `cmd_*` methods with their own
+            functionality.  There could be a subclass for every individual state
+            of your game.
+            """
+
+            def ev_quit(self, event: tcod.event.Quit) -> None:
+                """The window close button was clicked or Alt+F$ was pressed."""
+                print(event)
+                self.cmd_quit()
+
+            def ev_keydown(self, event: tcod.event.KeyDown) -> None:
+                """A key was pressed."""
+                print(event)
+                if event.sym in MOVE_KEYS:
+                    # Send movement keys to the cmd_move method with parameters.
+                    self.cmd_move(*MOVE_KEYS[event.sym])
+                elif event.sym == tcod.event.KeySym.ESCAPE:
+                    self.cmd_escape()
+
+            def ev_mousebuttondown(self, event: tcod.event.MouseButtonDown) -> None:
+                """The window was clicked."""
+                print(event)
+
+            def ev_mousemotion(self, event: tcod.event.MouseMotion) -> None:
+                """The mouse has moved within the window."""
+                print(event)
+
+            def cmd_move(self, x: int, y: int) -> None:
+                """Intent to move: `x` and `y` is the direction, both may be 0."""
+                print("Command move: " + str((x, y)))
+
+            def cmd_escape(self) -> None:
+                """Intent to exit this state."""
+                print("Command escape.")
+                self.cmd_quit()
+
+            def cmd_quit(self) -> None:
+                """Intent to exit the game."""
+                print("Command quit.")
+                raise SystemExit()
+
+
+        root_console = libtcodpy.console_init_root(80, 60)
+        state = State()
+        while True:
+            libtcodpy.console_flush()
+            for event in tcod.event.wait():
+                state.dispatch(event)
+    '''
+
+    __slots__ = ()
+
+    def dispatch(self, event: Any) -> T | None:  # noqa: ANN401
+        """Send an event to an `ev_*` method.
+
+        `*` will be the `event.type` attribute converted to lower-case.
+
+        Values returned by `ev_*` calls will be returned by this function.
+        This value always defaults to None for any non-overridden method.
+
+        .. versionchanged:: 11.12
+            Now returns the return value of `ev_*` methods.
+            `event.type` values of None are deprecated.
+        """
+        if event.type is None:
+            warnings.warn(
+                "`event.type` attribute should not be None.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return None
+        func_name = f"ev_{event.type.lower()}"
+        func: Callable[[Any], T | None] | None = getattr(self, func_name, None)
+        if func is None:
+            warnings.warn(f"{func_name} is missing from this EventDispatch object.", RuntimeWarning, stacklevel=2)
+            return None
+        return func(event)
+
+    def event_get(self) -> None:  # noqa: D102
+        for event in get():
+            self.dispatch(event)
+
+    def event_wait(self, timeout: float | None) -> None:  # noqa: D102
+        wait(timeout)
+        self.event_get()
+
+    def ev_quit(self, event: tcod.event.Quit, /) -> T | None:
+        """Called when the termination of the program is requested."""
+
+    def ev_keydown(self, event: tcod.event.KeyDown, /) -> T | None:
+        """Called when a keyboard key is pressed or repeated."""
+
+    def ev_keyup(self, event: tcod.event.KeyUp, /) -> T | None:
+        """Called when a keyboard key is released."""
+
+    def ev_mousemotion(self, event: tcod.event.MouseMotion, /) -> T | None:
+        """Called when the mouse is moved."""
+
+    def ev_mousebuttondown(self, event: tcod.event.MouseButtonDown, /) -> T | None:
+        """Called when a mouse button is pressed."""
+
+    def ev_mousebuttonup(self, event: tcod.event.MouseButtonUp, /) -> T | None:
+        """Called when a mouse button is released."""
+
+    def ev_mousewheel(self, event: tcod.event.MouseWheel, /) -> T | None:
+        """Called when the mouse wheel is scrolled."""
+
+    def ev_textinput(self, event: tcod.event.TextInput, /) -> T | None:
+        """Called to handle Unicode input."""
+
+    def ev_windowshown(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window is shown."""
+
+    def ev_windowhidden(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window is hidden."""
+
+    def ev_windowexposed(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when a window is exposed, and needs to be refreshed.
+
+        This usually means a call to :any:`libtcodpy.console_flush` is necessary.
+        """
+
+    def ev_windowmoved(self, event: tcod.event.WindowMoved, /) -> T | None:
+        """Called when the window is moved."""
+
+    def ev_windowresized(self, event: tcod.event.WindowResized, /) -> T | None:
+        """Called when the window is resized."""
+
+    def ev_windowminimized(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window is minimized."""
+
+    def ev_windowmaximized(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window is maximized."""
+
+    def ev_windowrestored(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window is restored."""
+
+    def ev_windowenter(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window gains mouse focus."""
+
+    def ev_windowleave(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window loses mouse focus."""
+
+    def ev_windowfocusgained(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window gains keyboard focus."""
+
+    def ev_windowfocuslost(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window loses keyboard focus."""
+
+    def ev_windowclose(self, event: tcod.event.WindowEvent, /) -> T | None:
+        """Called when the window manager requests the window to be closed."""
+
+    def ev_windowtakefocus(self, event: tcod.event.WindowEvent, /) -> T | None:  # noqa: D102
+        pass
+
+    def ev_windowhittest(self, event: tcod.event.WindowEvent, /) -> T | None:  # noqa: D102
+        pass
+
+    def ev_joyaxismotion(self, event: tcod.event.JoystickAxis, /) -> T | None:
+        """Called when a joystick analog is moved.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_joyballmotion(self, event: tcod.event.JoystickBall, /) -> T | None:
+        """Called when a joystick ball is moved.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_joyhatmotion(self, event: tcod.event.JoystickHat, /) -> T | None:
+        """Called when a joystick hat is moved.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_joybuttondown(self, event: tcod.event.JoystickButton, /) -> T | None:
+        """Called when a joystick button is pressed.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_joybuttonup(self, event: tcod.event.JoystickButton, /) -> T | None:
+        """Called when a joystick button is released.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_joydeviceadded(self, event: tcod.event.JoystickDevice, /) -> T | None:
+        """Called when a joystick is added.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_joydeviceremoved(self, event: tcod.event.JoystickDevice, /) -> T | None:
+        """Called when a joystick is removed.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_controlleraxismotion(self, event: tcod.event.ControllerAxis, /) -> T | None:
+        """Called when a controller analog is moved.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_controllerbuttondown(self, event: tcod.event.ControllerButton, /) -> T | None:
+        """Called when a controller button is pressed.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_controllerbuttonup(self, event: tcod.event.ControllerButton, /) -> T | None:
+        """Called when a controller button is released.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_controllerdeviceadded(self, event: tcod.event.ControllerDevice, /) -> T | None:
+        """Called when a standard controller is added.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_controllerdeviceremoved(self, event: tcod.event.ControllerDevice, /) -> T | None:
+        """Called when a standard controller is removed.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_controllerdeviceremapped(self, event: tcod.event.ControllerDevice, /) -> T | None:
+        """Called when a standard controller is remapped.
+
+        .. versionadded:: 13.8
+        """
+
+    def ev_(self, event: Any, /) -> T | None:  # noqa: ANN401, D102
+        pass
+
+
+def get_mouse_state() -> MouseState:
+    """Return the current state of the mouse.
+
+    .. versionadded:: 9.3
+    """
+    xy = ffi.new("float[2]")
+    buttons = lib.SDL_GetMouseState(xy, xy + 1)
+    tile = _pixel_to_tile(tuple(xy))
+    if tile is None:
+        return MouseState(position=Point(xy[0], xy[1]), tile=None, state=buttons)
+    return MouseState(position=Point(xy[0], xy[1]), tile=Point(floor(tile[0]), floor(tile[1])), state=buttons)
+
+
+@overload
+def convert_coordinates_from_window(
+    event: _EventType,
+    /,
+    context: tcod.context.Context | tcod.sdl.render.Renderer,
+    console: tcod.console.Console | tuple[int, int],
+    dest_rect: tuple[int, int, int, int] | None = None,
+) -> _EventType: ...
+@overload
+def convert_coordinates_from_window(
+    xy: tuple[float, float],
+    /,
+    context: tcod.context.Context | tcod.sdl.render.Renderer,
+    console: tcod.console.Console | tuple[int, int],
+    dest_rect: tuple[int, int, int, int] | None = None,
+) -> tuple[float, float]: ...
+def convert_coordinates_from_window(
+    event: _EventType | tuple[float, float],
+    /,
+    context: tcod.context.Context | tcod.sdl.render.Renderer,
+    console: tcod.console.Console | tuple[int, int],
+    dest_rect: tuple[int, int, int, int] | None = None,
+) -> _EventType | tuple[float, float]:
+    """Return an event or position with window mouse coordinates converted into console tile coordinates.
+
+    Args:
+        event: :any:`Event` to convert, or the `(x, y)` coordinates to convert.
+        context: Context or Renderer to fetch the SDL renderer from for reference with conversions.
+        console: A console used as a size reference.
+            Otherwise the `(columns, rows)` can be given directly as a tuple.
+        dest_rect: The consoles rendering destination as `(x, y, width, height)`.
+            If None is given then the whole rendering target is assumed.
+
+    .. versionadded:: 20.0
+    """
+    if isinstance(context, tcod.context.Context):
+        maybe_renderer: Final = context.sdl_renderer
+        if maybe_renderer is None:
+            return event
+        context = maybe_renderer
+
+    if isinstance(console, tcod.console.Console):
+        console = console.width, console.height
+
+    if dest_rect is None:
+        dest_rect = (0, 0, *(context.logical_size or context.output_size))
+
+    x_scale: Final = console[0] / dest_rect[2]
+    y_scale: Final = console[1] / dest_rect[3]
+    x_offset: Final = dest_rect[0]
+    y_offset: Final = dest_rect[1]
+
+    if not isinstance(event, Event):
+        x, y = context.coordinates_from_window(event)
+        return (x - x_offset) * x_scale, (y - y_offset) * y_scale
+
+    if isinstance(event, MouseMotion):
+        previous_position = convert_coordinates_from_window(
+            ((event.position[0] - event.motion[0]), (event.position[1] - event.motion[1])), context, console, dest_rect
+        )
+        position = convert_coordinates_from_window(event.position, context, console, dest_rect)
+        event.motion = Point(position[0] - previous_position[0], position[1] - previous_position[1])
+        event._tile_motion = Point(
+            floor(position[0]) - floor(previous_position[0]), floor(position[1]) - floor(previous_position[1])
+        )
+    elif isinstance(event, _MouseEventWithPosition):
+        event.position = Point(*convert_coordinates_from_window(event.position, context, console, dest_rect))
+        if isinstance(event, _MouseEventWithTile):
+            event._tile = Point(floor(event.position[0]), floor(event.position[1]))
+    return event
+
+
+@ffi.def_extern()  # type: ignore[untyped-decorator]
+def _sdl_event_watcher(userdata: Any, sdl_event: _C_SDL_Event) -> int:  # noqa: ANN401
+    callback: Callable[[Event], None] = ffi.from_handle(userdata)
+    callback(_parse_event(sdl_event))
+    return 0
+
+
+_EventCallback = TypeVar("_EventCallback", bound=Callable[[Event], None])
+_event_watch_handles: dict[Callable[[Event], None], Any] = {}  # Callbacks and their FFI handles.
+
+
+def add_watch(callback: _EventCallback) -> _EventCallback:
+    """Add a callback for watching events.
+
+    This function can be called with the callback to register, or be used as a decorator.
+
+    Callbacks added as event watchers can later be removed with :any:`tcod.event.remove_watch`.
+
+    .. warning::
+        How uncaught exceptions in a callback are handled is not currently defined by tcod.
+        They will likely be handled by :any:`sys.unraisablehook`.
+        This may be later changed to pass the exception to a :any:`tcod.event.get` or :any:`tcod.event.wait` call.
+
+    Args:
+        callback (Callable[[Event], None]):
+            A function which accepts :any:`Event` parameters.
+
+    Example::
+
+        import tcod.event
+
+        @tcod.event.add_watch
+        def handle_events(event: tcod.event.Event) -> None:
+            if isinstance(event, tcod.event.KeyDown):
+                print(event)
+
+    .. versionadded:: 13.4
+    """
+    if callback in _event_watch_handles:
+        warnings.warn(
+            f"{callback} is already an active event watcher, nothing was added.", RuntimeWarning, stacklevel=2
+        )
+        return callback
+    handle = _event_watch_handles[callback] = ffi.new_handle(callback)
+    lib.SDL_AddEventWatch(lib._sdl_event_watcher, handle)
+    return callback
+
+
+def remove_watch(callback: Callable[[Event], None]) -> None:
+    """Remove a callback as an event watcher.
+
+    Args:
+        callback (Callable[[Event], None]):
+            A function which has been previously registered with :any:`tcod.event.add_watch`.
+
+    .. versionadded:: 13.4
+    """
+    if callback not in _event_watch_handles:
+        warnings.warn(f"{callback} is not an active event watcher, nothing was removed.", RuntimeWarning, stacklevel=2)
+        return
+    handle = _event_watch_handles[callback]
+    lib.SDL_RemoveEventWatch(lib._sdl_event_watcher, handle)
+    del _event_watch_handles[callback]
+
+
+def get_keyboard_state() -> NDArray[np.bool_]:
+    """Return a boolean array with the current keyboard state.
+
+    Index this array with a scancode.  The value will be True if the key is
+    currently held.
+
+    Example::
+
+        state = tcod.event.get_keyboard_state()
+
+        # Get a WASD movement vector:
+        x = int(state[tcod.event.Scancode.D]) - int(state[tcod.event.Scancode.A])
+        y = int(state[tcod.event.Scancode.S]) - int(state[tcod.event.Scancode.W])
+
+        # Key with 'z' glyph is held:
+        is_z_held = state[tcod.event.KeySym.z.scancode]
+
+
+    .. versionadded:: 12.3
+    """
+    num_keys = ffi.new("int[1]")
+    keyboard_state = lib.SDL_GetKeyboardState(num_keys)
+    out: NDArray[np.bool_] = np.frombuffer(ffi.buffer(keyboard_state[0 : num_keys[0]]), dtype=np.bool_)
+    out.flags["WRITEABLE"] = False  # This buffer is supposed to be const.
+    return out
+
+
+def get_modifier_state() -> Modifier:
+    """Return a bitmask of the active keyboard modifiers.
+
+    .. versionadded:: 12.3
+    """
+    return Modifier(lib.SDL_GetModState())
+
+
+class Scancode(enum.IntEnum):
+    """A Scancode represents the physical location of a key.
+
+    For example the scan codes for WASD remain in the same physical location
+    regardless of the actual keyboard layout.
+
+    These names are derived from SDL except for the numbers which are prefixed
+    with ``N`` (since raw numbers can not be a Python name.)
+
+    .. versionadded:: 12.3
+
+    ==================  ===
+    UNKNOWN               0
+    A                     4
+    B                     5
+    C                     6
+    D                     7
+    E                     8
+    F                     9
+    G                    10
+    H                    11
+    I                    12
+    J                    13
+    K                    14
+    L                    15
+    M                    16
+    N                    17
+    O                    18
+    P                    19
+    Q                    20
+    R                    21
+    S                    22
+    T                    23
+    U                    24
+    V                    25
+    W                    26
+    X                    27
+    Y                    28
+    Z                    29
+    N1                   30
+    N2                   31
+    N3                   32
+    N4                   33
+    N5                   34
+    N6                   35
+    N7                   36
+    N8                   37
+    N9                   38
+    N0                   39
+    RETURN               40
+    ESCAPE               41
+    BACKSPACE            42
+    TAB                  43
+    SPACE                44
+    MINUS                45
+    EQUALS               46
+    LEFTBRACKET          47
+    RIGHTBRACKET         48
+    BACKSLASH            49
+    NONUSHASH            50
+    SEMICOLON            51
+    APOSTROPHE           52
+    GRAVE                53
+    COMMA                54
+    PERIOD               55
+    SLASH                56
+    CAPSLOCK             57
+    F1                   58
+    F2                   59
+    F3                   60
+    F4                   61
+    F5                   62
+    F6                   63
+    F7                   64
+    F8                   65
+    F9                   66
+    F10                  67
+    F11                  68
+    F12                  69
+    PRINTSCREEN          70
+    SCROLLLOCK           71
+    PAUSE                72
+    INSERT               73
+    HOME                 74
+    PAGEUP               75
+    DELETE               76
+    END                  77
+    PAGEDOWN             78
+    RIGHT                79
+    LEFT                 80
+    DOWN                 81
+    UP                   82
+    NUMLOCKCLEAR         83
+    KP_DIVIDE            84
+    KP_MULTIPLY          85
+    KP_MINUS             86
+    KP_PLUS              87
+    KP_ENTER             88
+    KP_1                 89
+    KP_2                 90
+    KP_3                 91
+    KP_4                 92
+    KP_5                 93
+    KP_6                 94
+    KP_7                 95
+    KP_8                 96
+    KP_9                 97
+    KP_0                 98
+    KP_PERIOD            99
+    NONUSBACKSLASH      100
+    APPLICATION         101
+    POWER               102
+    KP_EQUALS           103
+    F13                 104
+    F14                 105
+    F15                 106
+    F16                 107
+    F17                 108
+    F18                 109
+    F19                 110
+    F20                 111
+    F21                 112
+    F22                 113
+    F23                 114
+    F24                 115
+    EXECUTE             116
+    HELP                117
+    MENU                118
+    SELECT              119
+    STOP                120
+    AGAIN               121
+    UNDO                122
+    CUT                 123
+    COPY                124
+    PASTE               125
+    FIND                126
+    MUTE                127
+    VOLUMEUP            128
+    VOLUMEDOWN          129
+    KP_COMMA            133
+    KP_EQUALSAS400      134
+    INTERNATIONAL1      135
+    INTERNATIONAL2      136
+    INTERNATIONAL3      137
+    INTERNATIONAL4      138
+    INTERNATIONAL5      139
+    INTERNATIONAL6      140
+    INTERNATIONAL7      141
+    INTERNATIONAL8      142
+    INTERNATIONAL9      143
+    LANG1               144
+    LANG2               145
+    LANG3               146
+    LANG4               147
+    LANG5               148
+    LANG6               149
+    LANG7               150
+    LANG8               151
+    LANG9               152
+    ALTERASE            153
+    SYSREQ              154
+    CANCEL              155
+    CLEAR               156
+    PRIOR               157
+    RETURN2             158
+    SEPARATOR           159
+    OUT                 160
+    OPER                161
+    CLEARAGAIN          162
+    CRSEL               163
+    EXSEL               164
+    KP_00               176
+    KP_000              177
+    THOUSANDSSEPARATOR  178
+    DECIMALSEPARATOR    179
+    CURRENCYUNIT        180
+    CURRENCYSUBUNIT     181
+    KP_LEFTPAREN        182
+    KP_RIGHTPAREN       183
+    KP_LEFTBRACE        184
+    KP_RIGHTBRACE       185
+    KP_TAB              186
+    KP_BACKSPACE        187
+    KP_A                188
+    KP_B                189
+    KP_C                190
+    KP_D                191
+    KP_E                192
+    KP_F                193
+    KP_XOR              194
+    KP_POWER            195
+    KP_PERCENT          196
+    KP_LESS             197
+    KP_GREATER          198
+    KP_AMPERSAND        199
+    KP_DBLAMPERSAND     200
+    KP_VERTICALBAR      201
+    KP_DBLVERTICALBAR   202
+    KP_COLON            203
+    KP_HASH             204
+    KP_SPACE            205
+    KP_AT               206
+    KP_EXCLAM           207
+    KP_MEMSTORE         208
+    KP_MEMRECALL        209
+    KP_MEMCLEAR         210
+    KP_MEMADD           211
+    KP_MEMSUBTRACT      212
+    KP_MEMMULTIPLY      213
+    KP_MEMDIVIDE        214
+    KP_PLUSMINUS        215
+    KP_CLEAR            216
+    KP_CLEARENTRY       217
+    KP_BINARY           218
+    KP_OCTAL            219
+    KP_DECIMAL          220
+    KP_HEXADECIMAL      221
+    LCTRL               224
+    LSHIFT              225
+    LALT                226
+    LGUI                227
+    RCTRL               228
+    RSHIFT              229
+    RALT                230
+    RGUI                231
+    MODE                257
+    AUDIONEXT           258
+    AUDIOPREV           259
+    AUDIOSTOP           260
+    AUDIOPLAY           261
+    AUDIOMUTE           262
+    MEDIASELECT         263
+    WWW                 264
+    MAIL                265
+    CALCULATOR          266
+    COMPUTER            267
+    AC_SEARCH           268
+    AC_HOME             269
+    AC_BACK             270
+    AC_FORWARD          271
+    AC_STOP             272
+    AC_REFRESH          273
+    AC_BOOKMARKS        274
+    BRIGHTNESSDOWN      275
+    BRIGHTNESSUP        276
+    DISPLAYSWITCH       277
+    KBDILLUMTOGGLE      278
+    KBDILLUMDOWN        279
+    KBDILLUMUP          280
+    EJECT               281
+    SLEEP               282
+    APP1                283
+    APP2                284
+    ==================  ===
+
+    """
+
+    # --- SDL scancodes ---
+    UNKNOWN = 0
+    A = 4
+    B = 5
+    C = 6
+    D = 7
+    E = 8
+    F = 9
+    G = 10
+    H = 11
+    I = 12  # noqa: E741
+    J = 13
+    K = 14
+    L = 15
+    M = 16
+    N = 17
+    O = 18  # noqa: E741
+    P = 19
+    Q = 20
+    R = 21
+    S = 22
+    T = 23
+    U = 24
+    V = 25
+    W = 26
+    X = 27
+    Y = 28
+    Z = 29
+    N1 = 30
+    N2 = 31
+    N3 = 32
+    N4 = 33
+    N5 = 34
+    N6 = 35
+    N7 = 36
+    N8 = 37
+    N9 = 38
+    N0 = 39
+    RETURN = 40
+    ESCAPE = 41
+    BACKSPACE = 42
+    TAB = 43
+    SPACE = 44
+    MINUS = 45
+    EQUALS = 46
+    LEFTBRACKET = 47
+    RIGHTBRACKET = 48
+    BACKSLASH = 49
+    NONUSHASH = 50
+    SEMICOLON = 51
+    APOSTROPHE = 52
+    GRAVE = 53
+    COMMA = 54
+    PERIOD = 55
+    SLASH = 56
+    CAPSLOCK = 57
+    F1 = 58
+    F2 = 59
+    F3 = 60
+    F4 = 61
+    F5 = 62
+    F6 = 63
+    F7 = 64
+    F8 = 65
+    F9 = 66
+    F10 = 67
+    F11 = 68
+    F12 = 69
+    PRINTSCREEN = 70
+    SCROLLLOCK = 71
+    PAUSE = 72
+    INSERT = 73
+    HOME = 74
+    PAGEUP = 75
+    DELETE = 76
+    END = 77
+    PAGEDOWN = 78
+    RIGHT = 79
+    LEFT = 80
+    DOWN = 81
+    UP = 82
+    NUMLOCKCLEAR = 83
+    KP_DIVIDE = 84
+    KP_MULTIPLY = 85
+    KP_MINUS = 86
+    KP_PLUS = 87
+    KP_ENTER = 88
+    KP_1 = 89
+    KP_2 = 90
+    KP_3 = 91
+    KP_4 = 92
+    KP_5 = 93
+    KP_6 = 94
+    KP_7 = 95
+    KP_8 = 96
+    KP_9 = 97
+    KP_0 = 98
+    KP_PERIOD = 99
+    NONUSBACKSLASH = 100
+    APPLICATION = 101
+    POWER = 102
+    KP_EQUALS = 103
+    F13 = 104
+    F14 = 105
+    F15 = 106
+    F16 = 107
+    F17 = 108
+    F18 = 109
+    F19 = 110
+    F20 = 111
+    F21 = 112
+    F22 = 113
+    F23 = 114
+    F24 = 115
+    EXECUTE = 116
+    HELP = 117
+    MENU = 118
+    SELECT = 119
+    STOP = 120
+    AGAIN = 121
+    UNDO = 122
+    CUT = 123
+    COPY = 124
+    PASTE = 125
+    FIND = 126
+    MUTE = 127
+    VOLUMEUP = 128
+    VOLUMEDOWN = 129
+    KP_COMMA = 133
+    KP_EQUALSAS400 = 134
+    INTERNATIONAL1 = 135
+    INTERNATIONAL2 = 136
+    INTERNATIONAL3 = 137
+    INTERNATIONAL4 = 138
+    INTERNATIONAL5 = 139
+    INTERNATIONAL6 = 140
+    INTERNATIONAL7 = 141
+    INTERNATIONAL8 = 142
+    INTERNATIONAL9 = 143
+    LANG1 = 144
+    LANG2 = 145
+    LANG3 = 146
+    LANG4 = 147
+    LANG5 = 148
+    LANG6 = 149
+    LANG7 = 150
+    LANG8 = 151
+    LANG9 = 152
+    ALTERASE = 153
+    SYSREQ = 154
+    CANCEL = 155
+    CLEAR = 156
+    PRIOR = 157
+    RETURN2 = 158
+    SEPARATOR = 159
+    OUT = 160
+    OPER = 161
+    CLEARAGAIN = 162
+    CRSEL = 163
+    EXSEL = 164
+    KP_00 = 176
+    KP_000 = 177
+    THOUSANDSSEPARATOR = 178
+    DECIMALSEPARATOR = 179
+    CURRENCYUNIT = 180
+    CURRENCYSUBUNIT = 181
+    KP_LEFTPAREN = 182
+    KP_RIGHTPAREN = 183
+    KP_LEFTBRACE = 184
+    KP_RIGHTBRACE = 185
+    KP_TAB = 186
+    KP_BACKSPACE = 187
+    KP_A = 188
+    KP_B = 189
+    KP_C = 190
+    KP_D = 191
+    KP_E = 192
+    KP_F = 193
+    KP_XOR = 194
+    KP_POWER = 195
+    KP_PERCENT = 196
+    KP_LESS = 197
+    KP_GREATER = 198
+    KP_AMPERSAND = 199
+    KP_DBLAMPERSAND = 200
+    KP_VERTICALBAR = 201
+    KP_DBLVERTICALBAR = 202
+    KP_COLON = 203
+    KP_HASH = 204
+    KP_SPACE = 205
+    KP_AT = 206
+    KP_EXCLAM = 207
+    KP_MEMSTORE = 208
+    KP_MEMRECALL = 209
+    KP_MEMCLEAR = 210
+    KP_MEMADD = 211
+    KP_MEMSUBTRACT = 212
+    KP_MEMMULTIPLY = 213
+    KP_MEMDIVIDE = 214
+    KP_PLUSMINUS = 215
+    KP_CLEAR = 216
+    KP_CLEARENTRY = 217
+    KP_BINARY = 218
+    KP_OCTAL = 219
+    KP_DECIMAL = 220
+    KP_HEXADECIMAL = 221
+    LCTRL = 224
+    LSHIFT = 225
+    LALT = 226
+    LGUI = 227
+    RCTRL = 228
+    RSHIFT = 229
+    RALT = 230
+    RGUI = 231
+    MODE = 257
+    SLEEP = 258
+    WAKE = 259
+    CHANNEL_INCREMENT = 260
+    CHANNEL_DECREMENT = 261
+    MEDIA_PLAY = 262
+    MEDIA_PAUSE = 263
+    MEDIA_RECORD = 264
+    MEDIA_FAST_FORWARD = 265
+    MEDIA_REWIND = 266
+    MEDIA_NEXT_TRACK = 267
+    MEDIA_PREVIOUS_TRACK = 268
+    MEDIA_STOP = 269
+    MEDIA_EJECT = 270
+    MEDIA_PLAY_PAUSE = 271
+    MEDIA_SELECT = 272
+    AC_NEW = 273
+    AC_OPEN = 274
+    AC_CLOSE = 275
+    AC_EXIT = 276
+    AC_SAVE = 277
+    AC_PRINT = 278
+    AC_PROPERTIES = 279
+    AC_SEARCH = 280
+    AC_HOME = 281
+    AC_BACK = 282
+    AC_FORWARD = 283
+    AC_STOP = 284
+    AC_REFRESH = 285
+    AC_BOOKMARKS = 286
+    SOFTLEFT = 287
+    SOFTRIGHT = 288
+    CALL = 289
+    ENDCALL = 290
+    RESERVED = 400
+    COUNT = 512
+    # --- end ---
+
+    @property
+    def label(self) -> str:
+        """Return a human-readable name of a key based on its scancode.
+
+        Be sure not to confuse this with ``.name``, which will return the enum
+        name rather than the human-readable name.
+
+        .. seealso::
+            :any:`KeySym.label`
+        """
+        return self.keysym.label
+
+    @property
+    def keysym(self) -> KeySym:
+        """Return a :class:`KeySym` from a scancode.
+
+        Based on the current keyboard layout.
+        """
+        _init_sdl_video()
+        return KeySym(lib.SDL_GetKeyFromScancode(self.value, 0, False))  # noqa: FBT003
+
+    @property
+    def scancode(self) -> Scancode:
+        """Return a scancode from a keycode.
+
+        Returns itself since it is already a :class:`Scancode`.
+
+        .. seealso::
+            :any:`KeySym.scancode`
+        """
+        return self
+
+    @classmethod
+    def _missing_(cls, value: object) -> Scancode | None:
+        if not isinstance(value, int):
+            return None
+        result = cls(0)
+        result._value_ = value
+        return result
+
+    def __eq__(self, other: object) -> bool:
+        """Compare with another Scancode value.
+
+        Comparison between :any:`KeySym` and :any:`Scancode` is not allowed and will raise :any:`TypeError`.
+        """
+        if isinstance(other, KeySym):
+            msg = "Scancode and KeySym enums can not be compared directly. Convert one or the other to the same type."
+            raise TypeError(msg)
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        """Return the hash for this value."""
+        return super().__hash__()  # __eq__ was defined, so __hash__ must be defined
+
+    def __repr__(self) -> str:
+        """Return the fully qualified name of this enum."""
+        return f"tcod.event.{self.__class__.__name__}.{self.name}"
+
+
+class KeySym(enum.IntEnum):
+    """Keyboard constants based on their symbol.
+
+    These names are derived from SDL except for numbers which are prefixed with ``N`` (since raw numbers can not be a Python name).
+    Alternatively ``KeySym["9"]`` can be used to represent numbers (since Python 3.13).
+
+    .. versionadded:: 12.3
+
+    .. versionchanged:: 19.0
+        SDL backend was updated to 3.x, which means some enums have been renamed.
+        Single letters are now uppercase.
+
+    .. versionchanged:: 19.6
+        Number symbols can now be fetched with ``KeySym["9"]``, etc.
+        With Python 3.13 or later.
+
+    ==================  ==========
+    UNKNOWN                      0
+    BACKSPACE                    8
+    TAB                          9
+    RETURN                      13
+    ESCAPE                      27
+    SPACE                       32
+    EXCLAIM                     33
+    QUOTEDBL                    34
+    HASH                        35
+    DOLLAR                      36
+    PERCENT                     37
+    AMPERSAND                   38
+    QUOTE                       39
+    LEFTPAREN                   40
+    RIGHTPAREN                  41
+    ASTERISK                    42
+    PLUS                        43
+    COMMA                       44
+    MINUS                       45
+    PERIOD                      46
+    SLASH                       47
+    N0                          48
+    N1                          49
+    N2                          50
+    N3                          51
+    N4                          52
+    N5                          53
+    N6                          54
+    N7                          55
+    N8                          56
+    N9                          57
+    COLON                       58
+    SEMICOLON                   59
+    LESS                        60
+    EQUALS                      61
+    GREATER                     62
+    QUESTION                    63
+    AT                          64
+    LEFTBRACKET                 91
+    BACKSLASH                   92
+    RIGHTBRACKET                93
+    CARET                       94
+    UNDERSCORE                  95
+    BACKQUOTE                   96
+    A                           97
+    B                           98
+    C                           99
+    D                          100
+    E                          101
+    F                          102
+    G                          103
+    H                          104
+    I                          105
+    J                          106
+    K                          107
+    L                          108
+    M                          109
+    N                          110
+    O                          111
+    P                          112
+    Q                          113
+    R                          114
+    S                          115
+    T                          116
+    U                          117
+    V                          118
+    W                          119
+    X                          120
+    Y                          121
+    Z                          122
+    DELETE                     127
+    SCANCODE_MASK       1073741824
+    CAPSLOCK            1073741881
+    F1                  1073741882
+    F2                  1073741883
+    F3                  1073741884
+    F4                  1073741885
+    F5                  1073741886
+    F6                  1073741887
+    F7                  1073741888
+    F8                  1073741889
+    F9                  1073741890
+    F10                 1073741891
+    F11                 1073741892
+    F12                 1073741893
+    PRINTSCREEN         1073741894
+    SCROLLLOCK          1073741895
+    PAUSE               1073741896
+    INSERT              1073741897
+    HOME                1073741898
+    PAGEUP              1073741899
+    END                 1073741901
+    PAGEDOWN            1073741902
+    RIGHT               1073741903
+    LEFT                1073741904
+    DOWN                1073741905
+    UP                  1073741906
+    NUMLOCKCLEAR        1073741907
+    KP_DIVIDE           1073741908
+    KP_MULTIPLY         1073741909
+    KP_MINUS            1073741910
+    KP_PLUS             1073741911
+    KP_ENTER            1073741912
+    KP_1                1073741913
+    KP_2                1073741914
+    KP_3                1073741915
+    KP_4                1073741916
+    KP_5                1073741917
+    KP_6                1073741918
+    KP_7                1073741919
+    KP_8                1073741920
+    KP_9                1073741921
+    KP_0                1073741922
+    KP_PERIOD           1073741923
+    APPLICATION         1073741925
+    POWER               1073741926
+    KP_EQUALS           1073741927
+    F13                 1073741928
+    F14                 1073741929
+    F15                 1073741930
+    F16                 1073741931
+    F17                 1073741932
+    F18                 1073741933
+    F19                 1073741934
+    F20                 1073741935
+    F21                 1073741936
+    F22                 1073741937
+    F23                 1073741938
+    F24                 1073741939
+    EXECUTE             1073741940
+    HELP                1073741941
+    MENU                1073741942
+    SELECT              1073741943
+    STOP                1073741944
+    AGAIN               1073741945
+    UNDO                1073741946
+    CUT                 1073741947
+    COPY                1073741948
+    PASTE               1073741949
+    FIND                1073741950
+    MUTE                1073741951
+    VOLUMEUP            1073741952
+    VOLUMEDOWN          1073741953
+    KP_COMMA            1073741957
+    KP_EQUALSAS400      1073741958
+    ALTERASE            1073741977
+    SYSREQ              1073741978
+    CANCEL              1073741979
+    CLEAR               1073741980
+    PRIOR               1073741981
+    RETURN2             1073741982
+    SEPARATOR           1073741983
+    OUT                 1073741984
+    OPER                1073741985
+    CLEARAGAIN          1073741986
+    CRSEL               1073741987
+    EXSEL               1073741988
+    KP_00               1073742000
+    KP_000              1073742001
+    THOUSANDSSEPARATOR  1073742002
+    DECIMALSEPARATOR    1073742003
+    CURRENCYUNIT        1073742004
+    CURRENCYSUBUNIT     1073742005
+    KP_LEFTPAREN        1073742006
+    KP_RIGHTPAREN       1073742007
+    KP_LEFTBRACE        1073742008
+    KP_RIGHTBRACE       1073742009
+    KP_TAB              1073742010
+    KP_BACKSPACE        1073742011
+    KP_A                1073742012
+    KP_B                1073742013
+    KP_C                1073742014
+    KP_D                1073742015
+    KP_E                1073742016
+    KP_F                1073742017
+    KP_XOR              1073742018
+    KP_POWER            1073742019
+    KP_PERCENT          1073742020
+    KP_LESS             1073742021
+    KP_GREATER          1073742022
+    KP_AMPERSAND        1073742023
+    KP_DBLAMPERSAND     1073742024
+    KP_VERTICALBAR      1073742025
+    KP_DBLVERTICALBAR   1073742026
+    KP_COLON            1073742027
+    KP_HASH             1073742028
+    KP_SPACE            1073742029
+    KP_AT               1073742030
+    KP_EXCLAM           1073742031
+    KP_MEMSTORE         1073742032
+    KP_MEMRECALL        1073742033
+    KP_MEMCLEAR         1073742034
+    KP_MEMADD           1073742035
+    KP_MEMSUBTRACT      1073742036
+    KP_MEMMULTIPLY      1073742037
+    KP_MEMDIVIDE        1073742038
+    KP_PLUSMINUS        1073742039
+    KP_CLEAR            1073742040
+    KP_CLEARENTRY       1073742041
+    KP_BINARY           1073742042
+    KP_OCTAL            1073742043
+    KP_DECIMAL          1073742044
+    KP_HEXADECIMAL      1073742045
+    LCTRL               1073742048
+    LSHIFT              1073742049
+    LALT                1073742050
+    LGUI                1073742051
+    RCTRL               1073742052
+    RSHIFT              1073742053
+    RALT                1073742054
+    RGUI                1073742055
+    MODE                1073742081
+    AUDIONEXT           1073742082
+    AUDIOPREV           1073742083
+    AUDIOSTOP           1073742084
+    AUDIOPLAY           1073742085
+    AUDIOMUTE           1073742086
+    MEDIASELECT         1073742087
+    WWW                 1073742088
+    MAIL                1073742089
+    CALCULATOR          1073742090
+    COMPUTER            1073742091
+    AC_SEARCH           1073742092
+    AC_HOME             1073742093
+    AC_BACK             1073742094
+    AC_FORWARD          1073742095
+    AC_STOP             1073742096
+    AC_REFRESH          1073742097
+    AC_BOOKMARKS        1073742098
+    BRIGHTNESSDOWN      1073742099
+    BRIGHTNESSUP        1073742100
+    DISPLAYSWITCH       1073742101
+    KBDILLUMTOGGLE      1073742102
+    KBDILLUMDOWN        1073742103
+    KBDILLUMUP          1073742104
+    EJECT               1073742105
+    SLEEP               1073742106
+    ==================  ==========
+    """
+
+    # --- SDL keyboard symbols ---
+    UNKNOWN = 0
+    BACKSPACE = 8
+    TAB = 9
+    RETURN = 13
+    ESCAPE = 27
+    SPACE = 32
+    EXCLAIM = 33
+    DBLAPOSTROPHE = 34
+    HASH = 35
+    DOLLAR = 36
+    PERCENT = 37
+    AMPERSAND = 38
+    APOSTROPHE = 39
+    LEFTPAREN = 40
+    RIGHTPAREN = 41
+    ASTERISK = 42
+    PLUS = 43
+    COMMA = 44
+    MINUS = 45
+    PERIOD = 46
+    SLASH = 47
+    N0 = 48
+    N1 = 49
+    N2 = 50
+    N3 = 51
+    N4 = 52
+    N5 = 53
+    N6 = 54
+    N7 = 55
+    N8 = 56
+    N9 = 57
+    COLON = 58
+    SEMICOLON = 59
+    LESS = 60
+    EQUALS = 61
+    GREATER = 62
+    QUESTION = 63
+    AT = 64
+    LEFTBRACKET = 91
+    BACKSLASH = 92
+    RIGHTBRACKET = 93
+    CARET = 94
+    UNDERSCORE = 95
+    GRAVE = 96
+    A = 97
+    B = 98
+    C = 99
+    D = 100
+    E = 101
+    F = 102
+    G = 103
+    H = 104
+    I = 105  # noqa: E741
+    J = 106
+    K = 107
+    L = 108
+    M = 109
+    N = 110
+    O = 111  # noqa: E741
+    P = 112
+    Q = 113
+    R = 114
+    S = 115
+    T = 116
+    U = 117
+    V = 118
+    W = 119
+    X = 120
+    Y = 121
+    Z = 122
+    LEFTBRACE = 123
+    PIPE = 124
+    RIGHTBRACE = 125
+    TILDE = 126
+    DELETE = 127
+    PLUSMINUS = 177
+    EXTENDED_MASK = 536870912
+    LEFT_TAB = 536870913
+    LEVEL5_SHIFT = 536870914
+    MULTI_KEY_COMPOSE = 536870915
+    LMETA = 536870916
+    RMETA = 536870917
+    LHYPER = 536870918
+    RHYPER = 536870919
+    SCANCODE_MASK = 1073741824
+    CAPSLOCK = 1073741881
+    F1 = 1073741882
+    F2 = 1073741883
+    F3 = 1073741884
+    F4 = 1073741885
+    F5 = 1073741886
+    F6 = 1073741887
+    F7 = 1073741888
+    F8 = 1073741889
+    F9 = 1073741890
+    F10 = 1073741891
+    F11 = 1073741892
+    F12 = 1073741893
+    PRINTSCREEN = 1073741894
+    SCROLLLOCK = 1073741895
+    PAUSE = 1073741896
+    INSERT = 1073741897
+    HOME = 1073741898
+    PAGEUP = 1073741899
+    END = 1073741901
+    PAGEDOWN = 1073741902
+    RIGHT = 1073741903
+    LEFT = 1073741904
+    DOWN = 1073741905
+    UP = 1073741906
+    NUMLOCKCLEAR = 1073741907
+    KP_DIVIDE = 1073741908
+    KP_MULTIPLY = 1073741909
+    KP_MINUS = 1073741910
+    KP_PLUS = 1073741911
+    KP_ENTER = 1073741912
+    KP_1 = 1073741913
+    KP_2 = 1073741914
+    KP_3 = 1073741915
+    KP_4 = 1073741916
+    KP_5 = 1073741917
+    KP_6 = 1073741918
+    KP_7 = 1073741919
+    KP_8 = 1073741920
+    KP_9 = 1073741921
+    KP_0 = 1073741922
+    KP_PERIOD = 1073741923
+    APPLICATION = 1073741925
+    POWER = 1073741926
+    KP_EQUALS = 1073741927
+    F13 = 1073741928
+    F14 = 1073741929
+    F15 = 1073741930
+    F16 = 1073741931
+    F17 = 1073741932
+    F18 = 1073741933
+    F19 = 1073741934
+    F20 = 1073741935
+    F21 = 1073741936
+    F22 = 1073741937
+    F23 = 1073741938
+    F24 = 1073741939
+    EXECUTE = 1073741940
+    HELP = 1073741941
+    MENU = 1073741942
+    SELECT = 1073741943
+    STOP = 1073741944
+    AGAIN = 1073741945
+    UNDO = 1073741946
+    CUT = 1073741947
+    COPY = 1073741948
+    PASTE = 1073741949
+    FIND = 1073741950
+    MUTE = 1073741951
+    VOLUMEUP = 1073741952
+    VOLUMEDOWN = 1073741953
+    KP_COMMA = 1073741957
+    KP_EQUALSAS400 = 1073741958
+    ALTERASE = 1073741977
+    SYSREQ = 1073741978
+    CANCEL = 1073741979
+    CLEAR = 1073741980
+    PRIOR = 1073741981
+    RETURN2 = 1073741982
+    SEPARATOR = 1073741983
+    OUT = 1073741984
+    OPER = 1073741985
+    CLEARAGAIN = 1073741986
+    CRSEL = 1073741987
+    EXSEL = 1073741988
+    KP_00 = 1073742000
+    KP_000 = 1073742001
+    THOUSANDSSEPARATOR = 1073742002
+    DECIMALSEPARATOR = 1073742003
+    CURRENCYUNIT = 1073742004
+    CURRENCYSUBUNIT = 1073742005
+    KP_LEFTPAREN = 1073742006
+    KP_RIGHTPAREN = 1073742007
+    KP_LEFTBRACE = 1073742008
+    KP_RIGHTBRACE = 1073742009
+    KP_TAB = 1073742010
+    KP_BACKSPACE = 1073742011
+    KP_A = 1073742012
+    KP_B = 1073742013
+    KP_C = 1073742014
+    KP_D = 1073742015
+    KP_E = 1073742016
+    KP_F = 1073742017
+    KP_XOR = 1073742018
+    KP_POWER = 1073742019
+    KP_PERCENT = 1073742020
+    KP_LESS = 1073742021
+    KP_GREATER = 1073742022
+    KP_AMPERSAND = 1073742023
+    KP_DBLAMPERSAND = 1073742024
+    KP_VERTICALBAR = 1073742025
+    KP_DBLVERTICALBAR = 1073742026
+    KP_COLON = 1073742027
+    KP_HASH = 1073742028
+    KP_SPACE = 1073742029
+    KP_AT = 1073742030
+    KP_EXCLAM = 1073742031
+    KP_MEMSTORE = 1073742032
+    KP_MEMRECALL = 1073742033
+    KP_MEMCLEAR = 1073742034
+    KP_MEMADD = 1073742035
+    KP_MEMSUBTRACT = 1073742036
+    KP_MEMMULTIPLY = 1073742037
+    KP_MEMDIVIDE = 1073742038
+    KP_PLUSMINUS = 1073742039
+    KP_CLEAR = 1073742040
+    KP_CLEARENTRY = 1073742041
+    KP_BINARY = 1073742042
+    KP_OCTAL = 1073742043
+    KP_DECIMAL = 1073742044
+    KP_HEXADECIMAL = 1073742045
+    LCTRL = 1073742048
+    LSHIFT = 1073742049
+    LALT = 1073742050
+    LGUI = 1073742051
+    RCTRL = 1073742052
+    RSHIFT = 1073742053
+    RALT = 1073742054
+    RGUI = 1073742055
+    MODE = 1073742081
+    SLEEP = 1073742082
+    WAKE = 1073742083
+    CHANNEL_INCREMENT = 1073742084
+    CHANNEL_DECREMENT = 1073742085
+    MEDIA_PLAY = 1073742086
+    MEDIA_PAUSE = 1073742087
+    MEDIA_RECORD = 1073742088
+    MEDIA_FAST_FORWARD = 1073742089
+    MEDIA_REWIND = 1073742090
+    MEDIA_NEXT_TRACK = 1073742091
+    MEDIA_PREVIOUS_TRACK = 1073742092
+    MEDIA_STOP = 1073742093
+    MEDIA_EJECT = 1073742094
+    MEDIA_PLAY_PAUSE = 1073742095
+    MEDIA_SELECT = 1073742096
+    AC_NEW = 1073742097
+    AC_OPEN = 1073742098
+    AC_CLOSE = 1073742099
+    AC_EXIT = 1073742100
+    AC_SAVE = 1073742101
+    AC_PRINT = 1073742102
+    AC_PROPERTIES = 1073742103
+    AC_SEARCH = 1073742104
+    AC_HOME = 1073742105
+    AC_BACK = 1073742106
+    AC_FORWARD = 1073742107
+    AC_STOP = 1073742108
+    AC_REFRESH = 1073742109
+    AC_BOOKMARKS = 1073742110
+    SOFTLEFT = 1073742111
+    SOFTRIGHT = 1073742112
+    CALL = 1073742113
+    ENDCALL = 1073742114
+    # --- end ---
+
+    @property
+    def label(self) -> str:
+        """A human-readable name of a keycode.
+
+        Returns "" if the keycode doesn't have a name.
+
+        Be sure not to confuse this with ``.name``, which will return the enum
+        name rather than the human-readable name.
+
+        Example::
+
+            >>> import tcod.event
+            >>> tcod.event.KeySym.F1.label
+            'F1'
+            >>> tcod.event.KeySym.BACKSPACE.label
+            'Backspace'
+        """
+        return str(ffi.string(lib.SDL_GetKeyName(self.value)), encoding="utf-8")
+
+    @property
+    def keysym(self) -> KeySym:
+        """Return a keycode from a scancode.
+
+        Returns itself since it is already a :class:`KeySym`.
+
+        .. seealso::
+            :any:`Scancode.keysym`
+        """
+        return self
+
+    @property
+    def scancode(self) -> Scancode:
+        """Return a scancode from a keycode.
+
+        Based on the current keyboard layout.
+        """
+        _init_sdl_video()
+        return Scancode(lib.SDL_GetScancodeFromKey(self.value, ffi.NULL))
+
+    @classmethod
+    def _missing_(cls, value: object) -> KeySym | None:
+        if not isinstance(value, int):
+            return None
+        result = cls(0)
+        result._value_ = value
+        return result
+
+    def __eq__(self, other: object) -> bool:
+        """Compare with another KeySym value.
+
+        Comparison between :any:`KeySym` and :any:`Scancode` is not allowed and will raise :any:`TypeError`.
+        """
+        if isinstance(other, Scancode):
+            msg = "Scancode and KeySym enums can not be compared directly. Convert one or the other to the same type."
+            raise TypeError(msg)
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        """Return the hash for this value."""
+        return super().__hash__()  # __eq__ was defined, so __hash__ must be defined
+
+    def __repr__(self) -> str:
+        """Return the fully qualified name of this enum."""
+        return f"tcod.event.{self.__class__.__name__}.{self.name}"
+
+
+if sys.version_info >= (3, 13):
+    # Alias for lower case letters removed from SDL3
+    KeySym.A._add_alias_("a")
+    KeySym.B._add_alias_("b")
+    KeySym.C._add_alias_("c")
+    KeySym.D._add_alias_("d")
+    KeySym.E._add_alias_("e")
+    KeySym.F._add_alias_("f")
+    KeySym.G._add_alias_("g")
+    KeySym.H._add_alias_("h")
+    KeySym.I._add_alias_("i")
+    KeySym.J._add_alias_("j")
+    KeySym.K._add_alias_("k")
+    KeySym.L._add_alias_("l")
+    KeySym.M._add_alias_("m")
+    KeySym.N._add_alias_("n")
+    KeySym.O._add_alias_("o")
+    KeySym.P._add_alias_("p")
+    KeySym.Q._add_alias_("q")
+    KeySym.R._add_alias_("r")
+    KeySym.S._add_alias_("s")
+    KeySym.T._add_alias_("t")
+    KeySym.U._add_alias_("u")
+    KeySym.V._add_alias_("v")
+    KeySym.W._add_alias_("w")
+    KeySym.X._add_alias_("x")
+    KeySym.Y._add_alias_("y")
+    KeySym.Z._add_alias_("z")
+
+    # Alias for numbers, since Python enum names can not be number literals
+    KeySym.N0._add_alias_("0")
+    KeySym.N1._add_alias_("1")
+    KeySym.N2._add_alias_("2")
+    KeySym.N3._add_alias_("3")
+    KeySym.N4._add_alias_("4")
+    KeySym.N5._add_alias_("5")
+    KeySym.N6._add_alias_("6")
+    KeySym.N7._add_alias_("7")
+    KeySym.N8._add_alias_("8")
+    KeySym.N9._add_alias_("9")
+
+
+def __getattr__(name: str) -> int:
+    """Migrate deprecated access of event constants."""
+    if name.startswith("BUTTON_"):
+        replacement = {
+            "BUTTON_LEFT": MouseButton.LEFT,
+            "BUTTON_MIDDLE": MouseButton.MIDDLE,
+            "BUTTON_RIGHT": MouseButton.RIGHT,
+            "BUTTON_X1": MouseButton.X1,
+            "BUTTON_X2": MouseButton.X2,
+            "BUTTON_LMASK": MouseButtonMask.LEFT,
+            "BUTTON_MMASK": MouseButtonMask.MIDDLE,
+            "BUTTON_RMASK": MouseButtonMask.RIGHT,
+            "BUTTON_X1MASK": MouseButtonMask.X1,
+            "BUTTON_X2MASK": MouseButtonMask.X2,
+        }[name]
+        warnings.warn(
+            "Key constants have been replaced with enums.\n"
+            f"'tcod.event.{name}' should be replaced with 'tcod.event.{replacement!r}'",
+            FutureWarning,
+            stacklevel=2,
+        )
+        return replacement
+
+    if name.startswith("K_") and len(name) == 3:  # noqa: PLR2004
+        name = name.upper()  # Silently fix single letter key symbols removed from SDL3, these are still deprecated
+
+    value: int | None = getattr(tcod.event_constants, name, None)
+    if not value:
+        msg = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(msg)
+    if name.startswith("SCANCODE_"):
+        scancode = name[9:]
+        if scancode.isdigit():
+            scancode = f"N{scancode}"
+        warnings.warn(
+            "Key constants have been replaced with enums.\n"
+            f"`tcod.event.{name}` should be replaced with `tcod.event.Scancode.{scancode}`",
+            FutureWarning,
+            stacklevel=2,
+        )
+    elif name.startswith("K_"):
+        sym = name[2:]
+        if sym.isdigit():
+            sym = f"N{sym}"
+        warnings.warn(
+            "Key constants have been replaced with enums.\n"
+            f"`tcod.event.{name}` should be replaced with `tcod.event.KeySym.{sym}`",
+            FutureWarning,
+            stacklevel=2,
+        )
+    elif name.startswith("KMOD_"):
+        modifier = name[5:]
+        warnings.warn(
+            "Key modifiers have been replaced with the Modifier IntFlag.\n"
+            f"`tcod.event.{modifier}` should be replaced with `tcod.event.Modifier.{modifier}`",
+            FutureWarning,
+            stacklevel=2,
+        )
+    return value
+
+
+def time_ns() -> int:
+    """Return the nanoseconds elapsed since SDL was initialized.
+
+    .. versionadded:: 21.0
+    """
+    return int(lib.SDL_GetTicksNS())
+
+
+def time() -> float:
+    """Return the seconds elapsed since SDL was initialized.
+
+    .. versionadded:: 21.0
+    """
+    return time_ns() / 1_000_000_000
+
+
+__all__ = (  # noqa: F405 RUF022
+    "Point",
+    "Modifier",
+    "MouseButton",
+    "MouseButtonMask",
+    "Event",
+    "Quit",
+    "KeyboardEvent",
+    "KeyDown",
+    "KeyUp",
+    "MouseState",
+    "MouseMotion",
+    "MouseButtonEvent",
+    "MouseButtonDown",
+    "MouseButtonUp",
+    "MouseWheel",
+    "TextInput",
+    "WindowEvent",
+    "WindowMoved",
+    "WindowResized",
+    "JoystickEvent",
+    "JoystickAxis",
+    "JoystickBall",
+    "JoystickHat",
+    "JoystickButton",
+    "JoystickDevice",
+    "ControllerEvent",
+    "ControllerAxis",
+    "ControllerButton",
+    "ControllerDevice",
+    "Undefined",
+    "get",
+    "wait",
+    "get_mouse_state",
+    "add_watch",
+    "remove_watch",
+    "EventDispatch",
+    "get_keyboard_state",
+    "get_modifier_state",
+    "Scancode",
+    "KeySym",
+    "time_ns",
+    "time",
+    # --- From event_constants.py ---
+    "MOUSEWHEEL_NORMAL",
+    "MOUSEWHEEL_FLIPPED",
+)

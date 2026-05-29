@@ -18,7 +18,7 @@ class Action:
         """Return the engine this action belongs to."""
         return self.entity.gamemap.engine
 
-    def perform(self) -> None:
+    def perform(self) -> bool:
         """Perform this action with the objects needed to determine its scope.
 
         `self.engine` is the scope this action is being performed in.
@@ -30,12 +30,12 @@ class Action:
         raise NotImplementedError()
 
 class EscapeAction(Action):
-    def perform(self) -> None:
+    def perform(self) -> bool:
         raise SystemExit()
     
 class WaitAction(Action):
-    def perform(self) -> None:
-        pass
+    def perform(self) -> bool:
+        return True
 
 class ActionWithDirection(Action):
     def __init__(self, entity: Actor, dx: int, dy: int):
@@ -63,10 +63,10 @@ class ActionWithDirection(Action):
         raise NotImplementedError()
 
 class MeleeAction(ActionWithDirection):
-    def perform(self) -> None:
+    def perform(self) -> bool:
         target = self.target_actor
         if not target:
-            return  # No entity to attack.
+            return False # No entity to attack.
 
         damage = self.entity.fighter.power - target.fighter.defense
 
@@ -86,21 +86,24 @@ class MeleeAction(ActionWithDirection):
                 f"{attack_desc} but does no damage.", attack_color
             )
 
+        return True
+
 class MovementAction(ActionWithDirection):
-    def perform(self) -> None:
+    def perform(self) -> bool:
         dest_x, dest_y = self.dest_xy
 
         if not self.engine.game_map.in_bounds(dest_x, dest_y):
-            return  # Destination is out of bounds.
+            return False  # Destination is out of bounds.
         if not self.engine.game_map.tiles["walkable"][dest_x, dest_y]:
-            return  # Destination is blocked by a tile.
+            return False  # Destination is blocked by a tile.
         if self.engine.game_map.get_blocking_entity_at_location(dest_x, dest_y):
-            return  # Destination is blocked by an entity.
+            return False # Destination is blocked by an entity.
 
         self.entity.move(self.dx, self.dy)
+        return True
 
 class BumpAction(ActionWithDirection):
-    def perform(self) -> None:
+    def perform(self) -> bool:
         if self.target_actor:
             return MeleeAction(self.entity, self.dx, self.dy).perform()
         else:
