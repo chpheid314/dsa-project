@@ -65,7 +65,14 @@ class MainGameEventHandler(EventHandler):
             if action is None:
                 continue
 
-            action.perform()
+            self.engine.save_undo_state()
+
+            turn_taken = action.perform()
+
+            if not turn_taken:
+                self.engine.undo_history.pop()  # Undo 상태 저장 취소
+                continue
+
             self.engine.handle_enemy_turns()
             self.engine.update_fov()
 
@@ -81,8 +88,14 @@ class MainGameEventHandler(EventHandler):
             action = WaitAction(player)
         elif key == KeySym.ESCAPE:
             action = EscapeAction(player)
-        elif key == KeySym.v:
+        elif key == KeySym.V:
             self.engine.event_handler = HistoryViewer(self.engine)
+        elif key == KeySym.U:
+            self.engine.undo()
+            return None
+        elif key == KeySym.R:
+            self.engine.redo()
+            return None
 
         return action
     
