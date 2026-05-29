@@ -49,7 +49,8 @@ class EventHandler(tcod.event.EventDispatch[Action]):
         self.engine = engine
 
     def handle_events(self, event: tcod.event.Event) -> None:
-        self.handle_action(self.dispatch(event))
+        action = self.dispatch(event)
+        self.handle_action(action)
 
     def handle_action(self, action: Optional[Action]) -> bool:
         """Handle actions returned from event methods.
@@ -59,14 +60,20 @@ class EventHandler(tcod.event.EventDispatch[Action]):
         if action is None:
             return False
 
+        self.engine.save_undo_state()
+
         try:
-            action.perform()
+            turn_taken = action.perform()
         except exceptions.Impossible as exc:
+            self.engine.undo_history.pop()
             self.engine.message_log.add_message(exc.args[0], color.impossible)
-            return False  # Skip enemy turn on exceptions.
+            return False
+
+        if not turn_taken:
+            self.engine.undo_history.pop()
+            return False
 
         self.engine.handle_enemy_turns()
-
         self.engine.update_fov()
         return True
 
@@ -221,6 +228,12 @@ class MainGameEventHandler(EventHandler):
             self.engine.event_handler = InventoryActivateHandler(self.engine)
         elif key == KeySym.D:
             self.engine.event_handler = InventoryDropHandler(self.engine)
+        elif key == KeySym.U:
+            self.engine.undo()
+            return None
+        elif key == KeySym.R:
+            self.engine.redo()
+            return None
 
         # No valid key was pressed
         return action

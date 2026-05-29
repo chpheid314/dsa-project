@@ -19,7 +19,7 @@ class Action:
         """Return the engine this action belongs to."""
         return self.entity.gamemap.engine
 
-    def perform(self) -> None:
+    def perform(self) -> bool:
         """Perform this action with the objects needed to determine its scope.
 
         `self.engine` is the scope this action is being performed in.
@@ -70,17 +70,19 @@ class ItemAction(Action):
         """Return the actor at this actions destination."""
         return self.engine.game_map.get_actor_at_location(*self.target_xy)
 
-    def perform(self) -> None:
+    def perform(self) -> bool:
         """Invoke the items ability, this action will be given to provide context."""
         self.item.consumable.activate(self)
+        return True
 
 class DropItem(ItemAction):
-    def perform(self) -> None:
+    def perform(self) -> bool:
         self.entity.inventory.drop(self.item)
+        return True
     
 class WaitAction(Action):
-    def perform(self) -> None:
-        pass
+    def perform(self) -> bool:
+        return True
 
 class ActionWithDirection(Action):
     def __init__(self, entity: Actor, dx: int, dy: int):
@@ -108,7 +110,7 @@ class ActionWithDirection(Action):
         raise NotImplementedError()
 
 class MeleeAction(ActionWithDirection):
-    def perform(self) -> None:
+    def perform(self) -> bool:
         target = self.target_actor
         if not target:
             raise exceptions.Impossible("Nothing to attack.")
@@ -131,8 +133,10 @@ class MeleeAction(ActionWithDirection):
                 f"{attack_desc} but does no damage.", attack_color
             )
 
+        return True
+
 class MovementAction(ActionWithDirection):
-    def perform(self) -> None:
+    def perform(self) -> bool:
         dest_x, dest_y = self.dest_xy
 
         if not self.engine.game_map.in_bounds(dest_x, dest_y):
@@ -146,9 +150,10 @@ class MovementAction(ActionWithDirection):
             raise exceptions.Impossible("That way is blocked.")
 
         self.entity.move(self.dx, self.dy)
+        return True
 
 class BumpAction(ActionWithDirection):
-    def perform(self) -> None:
+    def perform(self) -> bool:
         if self.target_actor:
             return MeleeAction(self.entity, self.dx, self.dy).perform()
         else:
