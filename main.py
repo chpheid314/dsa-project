@@ -7,11 +7,10 @@ import color
 from engine import Engine
 import entity_factories
 from procgen import generate_dungeon
+from input_handlers import IDInputEventHandler
 
-def main() -> None:
-    screen_width = 80
-    screen_height = 50
 
+def new_game() -> Engine:
     map_width = 80
     map_height = 43
 
@@ -20,10 +19,6 @@ def main() -> None:
 
     max_monsters_per_room = 2
     max_items_per_room = 2
-
-    tileset = tcod.tileset.load_tilesheet(
-        "dejavu10x10_gs_tc.png", 32, 8, tcod.tileset.CHARMAP_TCOD
-    )
 
     player = copy.deepcopy(entity_factories.player)
 
@@ -36,36 +31,64 @@ def main() -> None:
         map_height=map_height,
         max_monsters_per_room=max_monsters_per_room,
         max_items_per_room=max_items_per_room,
-        engine = engine
+        engine=engine,
+        floor_number=1,
     )
 
     engine.update_fov()
 
     engine.message_log.add_message(
-        "Hello and welcome, adventurer, to yet another dungeon!", color.welcome_text
+        "Hello and welcome, adventurer, to yet another dungeon!",
+        color.welcome_text,
     )
 
+    engine.event_handler = IDInputEventHandler(engine)
+
+    return engine
+
+
+def main() -> None:
+    screen_width = 80
+    screen_height = 50
+
+    tileset = tcod.tileset.load_tilesheet(
+        "dejavu10x10_gs_tc.png",
+        32,
+        8,
+        tcod.tileset.CHARMAP_TCOD,
+    )
+
+    engine = new_game()
+
     with tcod.context.new(
-        columns = screen_width,
-        rows = screen_height,
+        columns=screen_width,
+        rows=screen_height,
         tileset=tileset,
-        title = "Yet Another Roguelike Tutorial",
+        title="Yet Another Roguelike Tutorial",
         vsync=True,
     ) as context:
-        root_console = tcod.console.Console(screen_width, screen_height, order = "F")
+        root_console = tcod.console.Console(screen_width, screen_height, order="F")
+
         while True:
+            if engine.restart_requested:
+                engine = new_game()
+
             root_console.clear()
             engine.event_handler.on_render(console=root_console)
             context.present(root_console)
-            
+
             try:
                 for event in tcod.event.wait():
-                    context.convert_event(event)
+                    event = context.convert_event(event)
                     engine.event_handler.handle_events(event)
-            except Exception:  # Handle exceptions in game.
-                traceback.print_exc()  # Print error to stderr.
-                # Then print the error to the message log.
+
+                    if engine.restart_requested:
+                        break
+
+            except Exception:
+                traceback.print_exc()
                 engine.message_log.add_message(traceback.format_exc(), color.error)
-        
+
+
 if __name__ == "__main__":
     main()

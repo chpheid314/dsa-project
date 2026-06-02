@@ -150,7 +150,23 @@ class MovementAction(ActionWithDirection):
             raise exceptions.Impossible("That way is blocked.")
 
         self.entity.move(self.dx, self.dy)
+
+        if self.entity is self.engine.player:
+            player_location = (self.entity.x, self.entity.y)
+
+            if player_location == self.engine.game_map.downstairs_location:
+                self.engine.cleared_floors += 1
+
+                if self.engine.cleared_floors >= 3:
+                    self.engine.finish_game()
+
+                    from input_handlers import LeaderboardEventHandler
+                    self.engine.event_handler = LeaderboardEventHandler(self.engine)
+                else:
+                    self.engine.advance_level()
+
         return True
+    
 
 class BumpAction(ActionWithDirection):
     def perform(self) -> bool:

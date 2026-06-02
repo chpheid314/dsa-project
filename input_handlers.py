@@ -82,6 +82,12 @@ class EventHandler(tcod.event.EventDispatch[Action]):
         if self.engine.game_map.in_bounds(tile_x, tile_y):
             self.engine.mouse_location = tile_x, tile_y
 
+    def ev_pixelsizechanged(self, event: tcod.event.PixelSizeChanged) -> None:
+        pass
+
+    def ev_clipboardupdate(self, event: tcod.event.ClipboardUpdate) -> None:
+        pass
+
     def ev_quit(self, event: tcod.event.Quit) -> Optional[Action]:
         raise SystemExit()
     
@@ -174,7 +180,7 @@ class InventoryEventHandler(AskUserEventHandler):
     def ev_keydown(self, event: tcod.event.KeyDown) -> Optional[Action]:
         player = self.engine.player
         key = event.sym
-        index = key - tcod.event.K_a
+        index = key - KeySym.A
 
         if 0 <= index <= 26:
             try:
@@ -207,6 +213,253 @@ class InventoryDropHandler(InventoryEventHandler):
         """Drop this item."""
         return actions.DropItem(self.engine.player, item)
 
+class IDInputEventHandler(EventHandler):
+    def __init__(self, engine: Engine):
+        super().__init__(engine)
+        self.current_text = ""
+
+    def on_render(self, console: Console) -> None:
+        console.clear()
+
+        console.print(
+            x=25,
+            y=15,
+            string="Enter Player ID",
+            fg=(255, 255, 255),
+        )
+
+        console.print(
+            x=25,
+            y=17,
+            string=f"ID: {self.current_text}",
+            fg=(255, 255, 0),
+        )
+
+        console.print(
+            x=25,
+            y=20,
+            string="Type your ID, then press ENTER",
+            fg=(180, 180, 180),
+        )
+
+    def ev_keydown(self, event: tcod.event.KeyDown) -> Optional[Action]:
+        key = event.sym
+
+        if key == KeySym.RETURN:
+            if self.current_text.strip():
+                self.engine.user_id = self.current_text.strip()
+                self.engine.start_timer()
+                self.engine.event_handler = MainGameEventHandler(self.engine)
+            return None
+
+        elif key == KeySym.BACKSPACE:
+            self.current_text = self.current_text[:-1]
+            return None
+
+        elif key == KeySym.ESCAPE:
+            raise SystemExit()
+
+        # Letters A-Z
+        elif KeySym.A <= key <= KeySym.Z:
+            letter = chr(ord("a") + (key - KeySym.A))
+
+            if event.mod & tcod.event.Modifier.SHIFT:
+                letter = letter.upper()
+
+            if len(self.current_text) < 12:
+                self.current_text += letter
+
+            return None
+
+        # Numbers 0-9
+        elif ord("0") <= int(key) <= ord("9"):
+            number = chr(int(key))
+
+            if len(self.current_text) < 12:
+                self.current_text += number
+
+            return None
+
+        # Space, underscore, hyphen
+        elif key == KeySym.SPACE:
+            if len(self.current_text) < 12:
+                self.current_text += " "
+            return None
+
+        elif key == KeySym.MINUS:
+            if len(self.current_text) < 12:
+                self.current_text += "-"
+            return None
+
+        return None
+
+class LeaderboardEventHandler(EventHandler):
+    def on_render(self, console: Console) -> None:
+        console.clear()
+
+        console.print(
+            x=2,
+            y=1,
+            string="LEADERBOARD",
+            fg=(255, 255, 0),
+        )
+
+        console.print(
+            x=2,
+            y=3,
+            string="Score Formula:",
+            fg=(255, 255, 0),
+        )
+
+        console.print(
+            x=4,
+            y=4,
+            string="Score = Cleared Floors * 1000",
+            fg=(180, 180, 180),
+        )
+
+        console.print(
+            x=12,
+            y=5,
+            string="+ Monsters Killed * 50",
+            fg=(180, 180, 180),
+        )
+
+        console.print(
+            x=12,
+            y=6,
+            string="+ Remaining Healing Items * 70",
+            fg=(180, 180, 180),
+        )
+
+        console.print(
+            x=12,
+            y=7,
+            string="+ Remaining HP * 10",
+            fg=(180, 180, 180),
+        )
+
+        console.print(
+            x=12,
+            y=8,
+            string="- Overtime Minutes * 300",
+            fg=(180, 180, 180),
+        )
+
+        console.print(
+            x=2,
+            y=10,
+            string="Rank  ID          Score   Floors  Kills  Items  HP  Time  Overtime",
+            fg=(255, 255, 255),
+        )
+
+        entries = self.engine.leaderboard.to_sorted_list()
+
+        y = 12
+
+        for rank, entry in enumerate(entries[:10], start=1):
+            console.print(
+                x=2,
+                y=y,
+                string=(
+                    f"{rank:<5} "
+                    f"{entry.user_id:<11} "
+                    f"{entry.score:<7} "
+                    f"{entry.cleared_floors:<7} "
+                    f"{entry.monsters_killed:<6} "
+                    f"{entry.remaining_items:<6} "
+                    f"{entry.remaining_hp:<3} "
+                    f"{entry.elapsed_minutes:<5} "
+                    f"{entry.overtime_minutes:<8}"
+                ),
+                fg=(220, 220, 220),
+            )
+            y += 1
+
+        y += 2
+
+        if self.engine.final_score_entry:
+            entry = self.engine.final_score_entry
+
+            console.print(x=2, y=y, string="Your Result", fg=(255, 255, 0))
+            y += 2
+
+            console.print(x=2, y=y, string=f"Player ID: {entry.user_id}", fg=(255, 255, 255))
+            y += 1
+            console.print(x=2, y=y, string=f"Final Score: {entry.score}", fg=(255, 255, 255))
+            y += 2
+
+            console.print(
+                x=2,
+                y=y,
+                string=f"Cleared Floors: {entry.cleared_floors} x 1000 = {entry.cleared_floors * 1000}",
+                fg=(200, 200, 200),
+            )
+            y += 1
+
+            console.print(
+                x=2,
+                y=y,
+                string=f"Monsters Killed: {entry.monsters_killed} x 50 = {entry.monsters_killed * 50}",
+                fg=(200, 200, 200),
+            )
+            y += 1
+
+            console.print(
+                x=2,
+                y=y,
+                string=f"Remaining Healing Items: {entry.remaining_items} x 70 = {entry.remaining_items * 70}",
+                fg=(200, 200, 200),
+            )
+            y += 1
+
+            console.print(
+                x=2,
+                y=y,
+                string=f"Remaining HP: {entry.remaining_hp} x 10 = {entry.remaining_hp * 10}",
+                fg=(200, 200, 200),
+            )
+            y += 1
+
+            console.print(
+                x=2,
+                y=y,
+                string=f"Overtime Penalty: {entry.overtime_minutes} x 300 = -{entry.overtime_minutes * 300}",
+                fg=(200, 200, 200),
+            )
+
+        if self.engine.game_finished:
+            console.print(
+                x=2,
+                y=46,
+                string="Press P to play again, E to exit",
+                fg=(255, 255, 255),
+            )
+        else:
+            console.print(
+                x=2,
+                y=46,
+                string="Press R to resume, E to exit",
+                fg=(255, 255, 255),
+            )
+
+    def ev_keydown(self, event: tcod.event.KeyDown) -> Optional[Action]:
+        key = event.sym
+
+        if key == KeySym.E:
+            raise SystemExit()
+
+        elif key == KeySym.R:
+            if not self.engine.game_finished:
+                self.engine.event_handler = MainGameEventHandler(self.engine)
+
+        elif key == KeySym.P:
+            if self.engine.game_finished:
+                self.engine.restart_requested = True
+
+        return None
+
+
 class MainGameEventHandler(EventHandler):
     def ev_keydown(self, event: tcod.event.KeyDown) -> Optional[Action]:
         action: Optional[Action] = None
@@ -234,6 +487,9 @@ class MainGameEventHandler(EventHandler):
         elif key == KeySym.R:
             self.engine.redo()
             return None
+        elif key == KeySym.L:
+            self.engine.event_handler = LeaderboardEventHandler(self.engine)
+            return None
 
         # No valid key was pressed
         return action
@@ -241,7 +497,7 @@ class MainGameEventHandler(EventHandler):
 
 class GameOverEventHandler(EventHandler):
     def ev_keydown(self, event: tcod.event.KeyDown) -> None:
-        if event.sym == tcod.event.K_ESCAPE:
+        if event.sym == tcod.event.KeySym.ESCAPE:
             raise SystemExit()
 
 class HistoryViewer(EventHandler):

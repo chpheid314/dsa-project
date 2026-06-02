@@ -30,9 +30,25 @@ troll = Actor(
     inventory=Inventory(capacity=0),
 )
 
+goblin = Actor(
+    char="G",
+    color=(255, 80, 80),
+    name="Goblin",
+    ai_cls=HostileEnemy,
+    fighter=Fighter(hp=18, defense=1, power=5),
+    inventory=Inventory(capacity=0),
+)
+
 health_potion = Item(
     char="!",
     color=(127, 0, 255),
     name="Health Potion",
     consumable=HealingConsumable(amount=4),
+)
+
+strong_health_potion = Item(
+    char="!",
+    color=(0, 255, 255),
+    name="Strong Health Potion",
+    consumable=HealingConsumable(amount=8),
 )

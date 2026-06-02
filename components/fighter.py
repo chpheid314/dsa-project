@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 import color
 from components.base_component import BaseComponent
-from input_handlers import GameOverEventHandler
 from render_order import RenderOrder
 
 if TYPE_CHECKING:
@@ -26,18 +25,27 @@ class Fighter(BaseComponent):
 
     @hp.setter
     def hp(self, value: int) -> None:
+        old_hp = self._hp
         self._hp = max(0, min(value, self.max_hp))
-        if self._hp == 0 and self.parent.ai:
+
+        if self._hp == 0 and old_hp > 0:
             self.die()
 
     def die(self) -> None:
         if self.engine.player is self.parent:
             death_message = "You died!"
             death_message_color = color.player_die
-            self.engine.event_handler = GameOverEventHandler(self.engine)
+
+            self.engine.finish_game()
+
+            from input_handlers import LeaderboardEventHandler
+            self.engine.event_handler = LeaderboardEventHandler(self.engine)
+
         else:
             death_message = f"{self.parent.name} is dead!"
-            death_message_color = color.player_die
+            death_message_color = color.enemy_die
+
+            self.engine.monsters_killed += 1
 
         self.parent.char = "%"
         self.parent.color = (191, 0, 0)
