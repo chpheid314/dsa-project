@@ -15,6 +15,7 @@ from actions import (
 )
 import color
 import exceptions
+from leaderboard import clear_leaderboard
 
 if TYPE_CHECKING:
     from engine import Engine
@@ -296,56 +297,48 @@ class IDInputEventHandler(EventHandler):
 class LeaderboardEventHandler(EventHandler):
     def on_render(self, console: Console) -> None:
         console.clear()
-
         console.print(
             x=2,
             y=1,
             string="LEADERBOARD",
             fg=(255, 255, 0),
         )
-
         console.print(
             x=2,
             y=3,
             string="Score Formula:",
             fg=(255, 255, 0),
         )
-
         console.print(
             x=4,
             y=4,
             string="Score = Cleared Floors * 1000",
             fg=(180, 180, 180),
         )
-
         console.print(
             x=12,
             y=5,
             string="+ Monsters Killed * 50",
             fg=(180, 180, 180),
         )
-
         console.print(
             x=12,
             y=6,
             string="+ Remaining Healing Items * 70",
             fg=(180, 180, 180),
         )
-
         console.print(
             x=12,
             y=7,
             string="+ Remaining HP * 10",
             fg=(180, 180, 180),
         )
-
         console.print(
             x=12,
             y=8,
             string="- Overtime Minutes * 300",
             fg=(180, 180, 180),
         )
-
         console.print(
             x=2,
             y=10,
@@ -432,14 +425,14 @@ class LeaderboardEventHandler(EventHandler):
             console.print(
                 x=2,
                 y=46,
-                string="Press P to play again, E to exit",
+                string="Press P to play again, C to clear scores, E to exit",
                 fg=(255, 255, 255),
             )
         else:
             console.print(
                 x=2,
                 y=46,
-                string="Press R to resume, E to exit",
+                string="Press R to resume, C to clear scores, E to exit",
                 fg=(255, 255, 255),
             )
 
@@ -451,11 +444,16 @@ class LeaderboardEventHandler(EventHandler):
 
         elif key == KeySym.R:
             if not self.engine.game_finished:
+                self.engine.resume_timer()
                 self.engine.event_handler = MainGameEventHandler(self.engine)
 
         elif key == KeySym.P:
             if self.engine.game_finished:
                 self.engine.restart_requested = True
+
+        elif key == KeySym.C:
+            self.engine.leaderboard = clear_leaderboard()
+            self.engine.final_score_entry = None
 
         return None
 
@@ -488,6 +486,7 @@ class MainGameEventHandler(EventHandler):
             self.engine.redo()
             return None
         elif key == KeySym.L:
+            self.engine.pause_timer()
             self.engine.event_handler = LeaderboardEventHandler(self.engine)
             return None
 
