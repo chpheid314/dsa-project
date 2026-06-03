@@ -48,8 +48,8 @@ def new_game() -> Engine:
 
 
 def main() -> None:
-    screen_width = 80
-    screen_height = 50
+    screen_width = 26
+    screen_height = 17
 
     tileset = tcod.tileset.load_tilesheet(
         "dejavu64x64_gs_tc_modification.png",
@@ -64,7 +64,7 @@ def main() -> None:
         columns=screen_width,
         rows=screen_height,
         tileset=tileset,
-        title="Yet Another Roguelike Tutorial",
+        title="DSA Project",
         vsync=True,
     ) as context:
         root_console = tcod.console.Console(screen_width, screen_height, order="F")

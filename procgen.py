@@ -111,29 +111,29 @@ def place_entities(
 
         if not any(entity.x == x and entity.y == y for entity in dungeon.entities):
             if floor_number == 1:
-                # Level 1: 80% orc, 20% troll.
+                # Level 1: 80% slime, 20% cactus.
                 if random.random() < 0.8:
-                    entity_factories.orc.spawn(dungeon, x, y)
+                    entity_factories.slime.spawn(dungeon, x, y)
                 else:
-                    entity_factories.troll.spawn(dungeon, x, y)
+                    entity_factories.cactus.spawn(dungeon, x, y)
 
             elif floor_number == 2:
-                # Level 2: 60% orc, 40% troll.
+                # Level 2: 60% slime, 40% cactus.
                 if random.random() < 0.6:
-                    entity_factories.orc.spawn(dungeon, x, y)
+                    entity_factories.slime.spawn(dungeon, x, y)
                 else:
-                    entity_factories.troll.spawn(dungeon, x, y)
+                    entity_factories.cactus.spawn(dungeon, x, y)
 
             else:
-                # Level 3: 40% orc, 40% troll, 20% goblin.
+                # Level 3: 40% slime, 40% cactus, 20% ghost.
                 monster_roll = random.random()
 
                 if monster_roll < 0.4:
-                    entity_factories.orc.spawn(dungeon, x, y)
+                    entity_factories.slime.spawn(dungeon, x, y)
                 elif monster_roll < 0.8:
-                    entity_factories.troll.spawn(dungeon, x, y)
+                    entity_factories.cactus.spawn(dungeon, x, y)
                 else:
-                    entity_factories.goblin.spawn(dungeon, x, y)
+                    entity_factories.ghost.spawn(dungeon, x, y)
 
     for i in range(number_of_items):
         x = random.randint(room.x1 + 1, room.x2 - 1)
@@ -142,22 +142,22 @@ def place_entities(
         if not any(entity.x == x and entity.y == y for entity in dungeon.entities):
             if floor_number == 1:
                 # Level 1: only normal health potions.
-                entity_factories.health_potion.spawn(dungeon, x, y)
+                entity_factories.hp_potion.spawn(dungeon, x, y)
 
             elif floor_number == 2:
                 # Level 2: 50% normal potion, 50% strong potion.
                 if random.random() < 0.5:
-                    entity_factories.health_potion.spawn(dungeon, x, y)
+                    entity_factories.hp_potion.spawn(dungeon, x, y)
                 else:
-                    entity_factories.strong_health_potion.spawn(dungeon, x, y)
+                    entity_factories.strong_hp_potion.spawn(dungeon, x, y)
 
             else:
                 # Level 3: strong potion is more frequent.
                 # 30% normal potion, 70% strong potion.
                 if random.random() < 0.3:
-                    entity_factories.health_potion.spawn(dungeon, x, y)
+                    entity_factories.hp_potion.spawn(dungeon, x, y)
                 else:
-                    entity_factories.strong_health_potion.spawn(dungeon, x, y)
+                    entity_factories.strong_hp_potion.spawn(dungeon, x, y)
 
 
 def tunnel_between(

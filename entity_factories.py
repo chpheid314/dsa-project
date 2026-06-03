@@ -5,7 +5,7 @@ from components.inventory import Inventory
 from entity import Actor, Item
 
 player = Actor(
-    char="─",
+    char="║",
     color=(255, 255, 255),
     name="Player",
     ai_cls=HostileEnemy,
@@ -13,16 +13,16 @@ player = Actor(
     inventory=Inventory(capacity=26),
 )
 
-orc = Actor(
-    char="┼",
+slime = Actor(
+    char="═",
     color=(255, 255, 255),
     name="Slime",
     ai_cls=HostileEnemy,
     fighter=Fighter(hp=10, defense=0, power=3),
     inventory=Inventory(capacity=0),
 )
-troll = Actor(
-    char="┤",
+cactus = Actor(
+    char="╬",
     color=(255, 255, 255),
     name="Cactus",
     ai_cls=HostileEnemy,
@@ -30,8 +30,8 @@ troll = Actor(
     inventory=Inventory(capacity=0),
 )
 
-goblin = Actor(
-    char="┴",
+ghost = Actor(
+    char="╣",
     color=(255, 255, 255),
     name="Ghost",
     ai_cls=HostileEnemy,
@@ -39,16 +39,16 @@ goblin = Actor(
     inventory=Inventory(capacity=0),
 )
 
-health_potion = Item(
-    char="├",
+hp_potion = Item(
+    char="╩",
     color=(255, 255, 255),
-    name="Health Potion",
+    name="HP Potion",
     consumable=HealingConsumable(amount=4),
 )
 
-strong_health_potion = Item(
-    char="┬",
+strong_hp_potion = Item(
+    char="╠",
     color=(255, 255, 255),
-    name="Strong Health Potion",
+    name="Strong HP Potion",
     consumable=HealingConsumable(amount=8),
 )
