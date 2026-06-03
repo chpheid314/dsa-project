@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 from tcod.console import Console
 from tcod.map import compute_fov
 
+import time
+from leaderboard import ScoreEntry, calculate_score, add_score, load_leaderboard
+import procgen
 import exceptions
 import color
 from input_handlers import MainGameEventHandler
@@ -27,8 +30,21 @@ class Engine:
         self.mouse_location = (0, 0)
         self.player = player
 
+        self.current_floor = 1
+        self.max_floors = 3
+
         self.undo_history = deque(maxlen=30)
         self.redo_history = deque(maxlen=30)
+
+        self.user_id = ""
+        self.start_time = 0.0
+        self.monsters_killed = 0
+        self.cleared_floors = 0
+        self.final_score_entry = None
+        self.leaderboard = load_leaderboard()
+        self.game_finished = False
+        self.score_saved = False
+        self.restart_requested = False
 
     def handle_enemy_turns(self) -> None:
         for entity in set(self.game_map.actors) - {self.player}:
@@ -47,11 +63,52 @@ class Engine:
         )
         # If a tile is "visible" it should be added to "explored".
         self.game_map.explored |= self.game_map.visible
+
+    def advance_level(self) -> None:
+        self.current_floor += 1
+
+        if self.current_floor > self.max_floors:
+            self.message_log.add_message("You escaped the dungeon!")
+            raise SystemExit()
+
+        self.message_log.add_message(f"You descend to level {self.current_floor}.")
+
+        if self.current_floor == 2:
+            max_monsters_per_room = 3
+            max_items_per_room = 2
+
+        elif self.current_floor == 3:
+            max_monsters_per_room = 3
+            max_items_per_room = 2
+
+        else:
+            max_monsters_per_room = 2
+            max_items_per_room = 1
+
+        self.game_map = procgen.generate_dungeon(
+            room_min_size=6,
+            room_max_size=12,
+            map_width=80,
+            map_height=43,
+            max_monsters_per_room=max_monsters_per_room,
+            max_items_per_room=max_items_per_room,
+            engine=self,
+            floor_number=self.current_floor,
+        )
+
+        # Reset player HP when entering a new level.
+        self.player.fighter.hp = self.player.fighter.max_hp
+
+        self.update_fov()
+
+        self.undo_history.clear()
+        self.redo_history.clear()
             
     def render(self, console: Console) -> None:
         self.game_map.render(console)
 
         self.message_log.render(console=console, x=21, y=45, width=40, height=5)
+        console.print(x=0, y=44, string=f"Level: {self.current_floor}")
 
         # HP bar
         render_bar(
@@ -115,6 +172,13 @@ class Engine:
         self.player = copy.deepcopy(snapshot.player)
         self.game_map = copy.deepcopy(snapshot.game_map)
 
+        self.current_floor = snapshot.current_floor
+        self.monsters_killed = snapshot.monsters_killed
+        self.cleared_floors = snapshot.cleared_floors
+        self.game_finished = snapshot.game_finished
+        self.score_saved = snapshot.score_saved
+        self.final_score_entry = snapshot.final_score_entry
+
         self.game_map.engine = self
 
         for entity in self.game_map.entities:
@@ -146,3 +210,60 @@ class Engine:
         self.undo_history.append(copy.deepcopy(self))
         snapshot = self.redo_history.pop()
         self.restore_state(snapshot)
+
+    def start_timer(self) -> None:
+        self.start_time = time.time()
+
+
+    def get_elapsed_minutes(self) -> int:
+        if self.start_time == 0:
+            return 0
+
+        elapsed_seconds = time.time() - self.start_time
+        return int(elapsed_seconds // 60)
+
+
+    def get_remaining_healing_items(self) -> int:
+        count = 0
+
+        if not hasattr(self.player, "inventory"):
+            return 0
+
+        for item in self.player.inventory.items:
+            if getattr(item, "consumable", None) is not None:
+                count += 1
+
+        return count
+
+
+    def finish_game(self) -> None:
+        if self.score_saved:
+            return
+
+        elapsed_minutes = self.get_elapsed_minutes()
+        remaining_items = self.get_remaining_healing_items()
+        remaining_hp = max(0, self.player.fighter.hp)
+
+        score, overtime_minutes = calculate_score(
+            cleared_floors=self.cleared_floors,
+            monsters_killed=self.monsters_killed,
+            remaining_items=remaining_items,
+            remaining_hp=remaining_hp,
+            elapsed_minutes=elapsed_minutes,
+        )
+
+        entry = ScoreEntry(
+            user_id=self.user_id,
+            score=score,
+            cleared_floors=self.cleared_floors,
+            monsters_killed=self.monsters_killed,
+            remaining_items=remaining_items,
+            remaining_hp=remaining_hp,
+            elapsed_minutes=elapsed_minutes,
+            overtime_minutes=overtime_minutes,
+        )
+
+        self.final_score_entry = entry
+        self.leaderboard = add_score(entry)
+        self.game_finished = True
+        self.score_saved = True

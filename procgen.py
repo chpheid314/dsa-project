@@ -80,27 +80,85 @@ def create_room_from_leaf(
 
     
 def place_entities(
-    room: RectangularRoom, dungeon: GameMap, maximum_monsters: int, maximum_items: int
+    room: RectangularRoom,
+    dungeon: GameMap,
+    maximum_monsters: int,
+    maximum_items: int,
+    floor_number: int,
 ) -> None:
-    number_of_monsters = random.randint(0, maximum_monsters)
-    number_of_items = random.randint(0, maximum_items)
+    if floor_number == 1:
+        # Level 1: original difficulty.
+        number_of_monsters = random.randint(0, maximum_monsters)
+        number_of_items = random.randint(0, maximum_items)
+
+    elif floor_number == 2:
+        # Level 2: monsters are optional, but trolls are more common.
+        number_of_monsters = random.randint(0, maximum_monsters)
+
+        # Level 2: more potions than Level 1.
+        number_of_items = random.randint(1, maximum_items + 1)
+
+    else:
+        # Level 3: at least one monster per room, max 3.
+        number_of_monsters = random.randint(1, 3)
+
+        # Level 3: still gives potions.
+        number_of_items = random.randint(1, maximum_items + 1)
 
     for i in range(number_of_monsters):
         x = random.randint(room.x1 + 1, room.x2 - 1)
         y = random.randint(room.y1 + 1, room.y2 - 1)
 
         if not any(entity.x == x and entity.y == y for entity in dungeon.entities):
-            if random.random() < 0.8:
-                entity_factories.orc.spawn(dungeon, x, y)
+            if floor_number == 1:
+                # Level 1: 80% orc, 20% troll.
+                if random.random() < 0.8:
+                    entity_factories.orc.spawn(dungeon, x, y)
+                else:
+                    entity_factories.troll.spawn(dungeon, x, y)
+
+            elif floor_number == 2:
+                # Level 2: 60% orc, 40% troll.
+                if random.random() < 0.6:
+                    entity_factories.orc.spawn(dungeon, x, y)
+                else:
+                    entity_factories.troll.spawn(dungeon, x, y)
+
             else:
-                entity_factories.troll.spawn(dungeon, x, y)
+                # Level 3: 40% orc, 40% troll, 20% goblin.
+                monster_roll = random.random()
+
+                if monster_roll < 0.4:
+                    entity_factories.orc.spawn(dungeon, x, y)
+                elif monster_roll < 0.8:
+                    entity_factories.troll.spawn(dungeon, x, y)
+                else:
+                    entity_factories.goblin.spawn(dungeon, x, y)
 
     for i in range(number_of_items):
         x = random.randint(room.x1 + 1, room.x2 - 1)
         y = random.randint(room.y1 + 1, room.y2 - 1)
 
         if not any(entity.x == x and entity.y == y for entity in dungeon.entities):
-            entity_factories.health_potion.spawn(dungeon, x, y)
+            if floor_number == 1:
+                # Level 1: only normal health potions.
+                entity_factories.health_potion.spawn(dungeon, x, y)
+
+            elif floor_number == 2:
+                # Level 2: 50% normal potion, 50% strong potion.
+                if random.random() < 0.5:
+                    entity_factories.health_potion.spawn(dungeon, x, y)
+                else:
+                    entity_factories.strong_health_potion.spawn(dungeon, x, y)
+
+            else:
+                # Level 3: strong potion is more frequent.
+                # 30% normal potion, 70% strong potion.
+                if random.random() < 0.3:
+                    entity_factories.health_potion.spawn(dungeon, x, y)
+                else:
+                    entity_factories.strong_health_potion.spawn(dungeon, x, y)
+
 
 def tunnel_between(
     start: Tuple[int, int], end: Tuple[int, int]
@@ -122,6 +180,40 @@ def tunnel_between(
         yield x, y
 
 
+def tunnel_to_edge(
+    start: Tuple[int, int],
+    map_width: int,
+    map_height: int,
+) -> Iterator[Tuple[int, int]]:
+    """Create a straight tunnel from a point to the nearest map edge."""
+    x, y = start
+
+    distances = {
+        "left": x,
+        "right": map_width - 1 - x,
+        "top": y,
+        "bottom": map_height - 1 - y,
+    }
+
+    nearest_edge = min(distances, key=distances.get)
+
+    if nearest_edge == "left":
+        for tunnel_x in range(x, -1, -1):
+            yield tunnel_x, y
+
+    elif nearest_edge == "right":
+        for tunnel_x in range(x, map_width):
+            yield tunnel_x, y
+
+    elif nearest_edge == "top":
+        for tunnel_y in range(y, -1, -1):
+            yield x, tunnel_y
+
+    elif nearest_edge == "bottom":
+        for tunnel_y in range(y, map_height):
+            yield x, tunnel_y
+
+    
 def generate_dungeon(
     room_min_size: int,
     room_max_size: int,
@@ -130,6 +222,7 @@ def generate_dungeon(
     max_monsters_per_room: int,
     max_items_per_room: int,
     engine: Engine,
+    floor_number: int = 1,
 ) -> GameMap:
 
     player = engine.player
@@ -185,8 +278,29 @@ def generate_dungeon(
             ):
                 dungeon.tiles[x, y] = tile_types.floor
 
-        place_entities(room, dungeon, max_monsters_per_room, max_items_per_room)
+        place_entities(
+            room,
+            dungeon,
+            max_monsters_per_room,
+            max_items_per_room,
+            floor_number,
+        )
 
         rooms.append(room)
+
+    if rooms:
+        exit_path = list(
+            tunnel_to_edge(
+                rooms[-1].center,
+                map_width,
+                map_height,
+            )
+        )
+
+        for x, y in exit_path:
+            dungeon.tiles[x, y] = tile_types.floor
+
+        dungeon.downstairs_location = exit_path[-1]
+        dungeon.tiles[dungeon.downstairs_location] = tile_types.down_stairs
 
     return dungeon
