@@ -14,8 +14,7 @@ import exceptions
 import color
 from input_handlers import MainGameEventHandler
 from message_log import MessageLog
-from render_functions import render_bar, render_names_at_mouse_location
-
+from render_functions import render_bar, render_names_or_timer
 if TYPE_CHECKING:
     from entity import Actor
     from game_map import GameMap
@@ -148,14 +147,6 @@ class Engine:
             text=f"Lv:{self.current_floor}"
         )
 
-        timer_text = f"Time: {self.get_elapsed_time_string()}"
-        console.print(
-            x=console.width - len(timer_text) - 1,
-            y=ui_y,
-            text=timer_text,
-            fg=(255, 255, 255),
-        )
-
         # HP bar
         render_bar(
             console=console,
@@ -195,11 +186,14 @@ class Engine:
             empty_color=color.bar_empty
         )
 
-        render_names_at_mouse_location(
+        timer_text = f"Time: {self.get_elapsed_time_string()}"
+
+        render_names_or_timer(
             console=console,
-            x=10,
+            #x: right align
             y=ui_y,
             engine=self,
+            timer_text=timer_text,
         )
 
 

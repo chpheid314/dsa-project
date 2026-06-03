@@ -59,14 +59,26 @@ def render_bar(
         fg=color.bar_text
     )
 
-
-def render_names_at_mouse_location(
-    console: Console, x: int, y: int, engine: Engine
-) -> None:
+def render_names_or_timer(
+    console: Console, y: int, engine: Engine, timer_text: str,
+):
     mouse_x, mouse_y = engine.mouse_location
 
-    names_at_mouse_location = get_names_at_location(
-        x=mouse_x, y=mouse_y, game_map=engine.game_map
+    names = get_names_at_location(
+        x=mouse_x,
+        y=mouse_y,
+        game_map=engine.game_map,
     )
 
-    console.print(x=x, y=y, string=names_at_mouse_location)
+    if names:
+        console.print(
+            x=console.width - len(names) - 1,
+            y=y,
+            string=names,
+        )
+    else:
+        console.print(
+            x=console.width - len(timer_text) - 1,
+            y=y,
+            string=timer_text,
+        )
