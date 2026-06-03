@@ -109,3 +109,10 @@ def add_score(entry: ScoreEntry) -> LeaderboardBST:
     bst.insert(entry)
     save_leaderboard(bst)
     return bst
+
+def clear_leaderboard() -> LeaderboardBST:
+    """Delete all saved leaderboard scores and return an empty leaderboard."""
+    if os.path.exists(LEADERBOARD_FILE):
+        os.remove(LEADERBOARD_FILE)
+
+    return LeaderboardBST()

@@ -37,7 +37,11 @@ class Engine:
         self.redo_history = deque(maxlen=30)
 
         self.user_id = ""
+
         self.start_time = 0.0
+        self.elapsed_before_pause = 0.0
+        self.timer_running = False
+
         self.monsters_killed = 0
         self.cleared_floors = 0
         self.final_score_entry = None
@@ -109,6 +113,14 @@ class Engine:
 
         self.message_log.render(console=console, x=21, y=45, width=40, height=5)
         console.print(x=0, y=44, string=f"Level: {self.current_floor}")
+
+        timer_text = f"Time: {self.get_elapsed_time_string()}"
+        console.print(
+            x=console.width - len(timer_text) - 1,
+            y=49,
+            string=timer_text,
+            fg=(255, 255, 255),
+        )
 
         # HP bar
         render_bar(
@@ -213,14 +225,43 @@ class Engine:
 
     def start_timer(self) -> None:
         self.start_time = time.time()
+        self.elapsed_before_pause = 0.0
+        self.timer_running = True
 
 
-    def get_elapsed_minutes(self) -> int:
+    def pause_timer(self) -> None:
+        if self.timer_running:
+            self.elapsed_before_pause += time.time() - self.start_time
+            self.timer_running = False
+
+
+    def resume_timer(self) -> None:
+        if not self.timer_running and not self.game_finished:
+            self.start_time = time.time()
+            self.timer_running = True
+
+
+    def get_elapsed_seconds(self) -> int:
         if self.start_time == 0:
             return 0
 
-        elapsed_seconds = time.time() - self.start_time
-        return int(elapsed_seconds // 60)
+        if self.timer_running:
+            elapsed = self.elapsed_before_pause + (time.time() - self.start_time)
+        else:
+            elapsed = self.elapsed_before_pause
+
+        return int(elapsed)
+
+
+    def get_elapsed_minutes(self) -> int:
+        return self.get_elapsed_seconds() // 60
+
+
+    def get_elapsed_time_string(self) -> str:
+        elapsed_seconds = self.get_elapsed_seconds()
+        minutes = elapsed_seconds // 60
+        seconds = elapsed_seconds % 60
+        return f"{minutes:02}:{seconds:02}"
 
 
     def get_remaining_healing_items(self) -> int:
@@ -239,6 +280,8 @@ class Engine:
     def finish_game(self) -> None:
         if self.score_saved:
             return
+        
+        self.pause_timer()
 
         elapsed_minutes = self.get_elapsed_minutes()
         remaining_items = self.get_remaining_healing_items()
