@@ -52,7 +52,7 @@ def main() -> None:
     screen_height = 50
 
     tileset = tcod.tileset.load_tilesheet(
-        "dejavu10x10_gs_tc.png",
+        "dejavu64x64_gs_tc_modification.png",
         32,
         8,
         tcod.tileset.CHARMAP_TCOD,

@@ -47,7 +47,7 @@ class Fighter(BaseComponent):
 
             self.engine.monsters_killed += 1
 
-        self.parent.char = "%"
+        self.parent.char = "└"
         self.parent.color = (191, 0, 0)
         self.parent.blocks_movement = False
         self.parent.ai = None
