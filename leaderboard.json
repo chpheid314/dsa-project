@@ -1,0 +1,52 @@
+[
+    {
+        "user_id": "aaa",
+        "score": 5720,
+        "cleared_floors": 3,
+        "monsters_killed": 43,
+        "remaining_items": 7,
+        "remaining_hp": 8,
+        "elapsed_minutes": 6,
+        "overtime_minutes": 0
+    },
+    {
+        "user_id": "ddd",
+        "score": 2890,
+        "cleared_floors": 1,
+        "monsters_killed": 21,
+        "remaining_items": 12,
+        "remaining_hp": 0,
+        "elapsed_minutes": 1,
+        "overtime_minutes": 0
+    },
+    {
+        "user_id": "ccc",
+        "score": 1650,
+        "cleared_floors": 1,
+        "monsters_killed": 13,
+        "remaining_items": 0,
+        "remaining_hp": 0,
+        "elapsed_minutes": 0,
+        "overtime_minutes": 0
+    },
+    {
+        "user_id": "bbb",
+        "score": 1550,
+        "cleared_floors": 1,
+        "monsters_killed": 11,
+        "remaining_items": 0,
+        "remaining_hp": 0,
+        "elapsed_minutes": 1,
+        "overtime_minutes": 0
+    },
+    {
+        "user_id": "eee",
+        "score": 250,
+        "cleared_floors": 0,
+        "monsters_killed": 5,
+        "remaining_items": 0,
+        "remaining_hp": 0,
+        "elapsed_minutes": 0,
+        "overtime_minutes": 0
+    }
+]
