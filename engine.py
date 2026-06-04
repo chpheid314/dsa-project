@@ -14,8 +14,7 @@ import exceptions
 import color
 from input_handlers import MainGameEventHandler
 from message_log import MessageLog
-from render_functions import render_bar, render_names_at_mouse_location
-
+from render_functions import render_bar, render_names_or_timer
 if TYPE_CHECKING:
     from entity import Actor
     from game_map import GameMap
@@ -49,6 +48,9 @@ class Engine:
         self.game_finished = False
         self.score_saved = False
         self.restart_requested = False
+
+        self.camera_width = 26
+        self.camera_height = 12
 
     def handle_enemy_turns(self) -> None:
         for entity in set(self.game_map.actors) - {self.player}:
@@ -107,19 +109,42 @@ class Engine:
 
         self.undo_history.clear()
         self.redo_history.clear()
+
+    def get_camera_origin(self) -> tuple[int, int]:
+        camera_x = self.player.x - self.camera_width // 2
+        camera_y = self.player.y - self.camera_height // 2
+
+        camera_x = max(0, camera_x)
+        camera_y = max(0, camera_y)
+
+        camera_x = min(
+            camera_x,
+            self.game_map.width - self.camera_width,
+        )
+
+        camera_y = min(
+            camera_y,
+            self.game_map.height - self.camera_height,
+        )
+
+        return camera_x, camera_y
             
     def render(self, console: Console) -> None:
         self.game_map.render(console)
 
-        self.message_log.render(console=console, x=21, y=45, width=40, height=5)
-        console.print(x=0, y=44, string=f"Level: {self.current_floor}")
+        ui_y = self.camera_height
 
-        timer_text = f"Time: {self.get_elapsed_time_string()}"
+        self.message_log.render(
+            console=console,
+            x=0,
+            y=ui_y + 4,
+            width=26,
+            height=1,
+        )
         console.print(
-            x=console.width - len(timer_text) - 1,
-            y=49,
-            string=timer_text,
-            fg=(255, 255, 255),
+            x=0,
+            y=ui_y,
+            text=f"Lv:{self.current_floor}"
         )
 
         # HP bar
@@ -129,7 +154,7 @@ class Engine:
             maximum_value=self.player.fighter.max_hp,
             total_width=20,
             x = 0,
-            y = 45,
+            y = ui_y + 1,
             text = f"HP: {self.player.fighter.hp}/{self.player.fighter.max_hp}",
             filled_color=(255, 0, 0), # red!
             empty_color=color.bar_empty
@@ -142,7 +167,7 @@ class Engine:
             maximum_value=self.undo_history.maxlen,
             total_width=20,
             x = 0,
-            y = 47,
+            y = ui_y + 2,
             text = f"Undo: {len(self.undo_history)}/{self.undo_history.maxlen}",
             filled_color=(135, 106, 250), # purple!
             empty_color=color.bar_empty
@@ -155,13 +180,21 @@ class Engine:
             maximum_value=self.redo_history.maxlen,
             total_width=20,
             x = 0,
-            y = 49,
+            y = ui_y + 3,
             text = f"Redo: {len(self.redo_history)}/{self.redo_history.maxlen}",
             filled_color=(100, 180, 255), # blue!
             empty_color=color.bar_empty
         )
 
-        render_names_at_mouse_location(console=console, x=21, y=44, engine=self)
+        timer_text = f"Time: {self.get_elapsed_time_string()}"
+
+        render_names_or_timer(
+            console=console,
+            #x: right align
+            y=ui_y,
+            engine=self,
+            timer_text=timer_text,
+        )
 
 
     def __getstate__(self):

@@ -79,9 +79,15 @@ class EventHandler(tcod.event.EventDispatch[Action]):
         return True
 
     def ev_mousemotion(self, event: tcod.event.MouseMotion) -> None:
-        tile_x, tile_y = event.integer_position
-        if self.engine.game_map.in_bounds(tile_x, tile_y):
-            self.engine.mouse_location = tile_x, tile_y
+        screen_x, screen_y = event.integer_position
+
+        camera_x, camera_y = self.engine.get_camera_origin()
+
+        world_x = screen_x + camera_x
+        world_y = screen_y + camera_y
+
+        if self.engine.game_map.in_bounds(world_x, world_y):
+            self.engine.mouse_location = (world_x, world_y)
 
     def ev_pixelsizechanged(self, event: tcod.event.PixelSizeChanged) -> None:
         pass
@@ -151,14 +157,14 @@ class InventoryEventHandler(AskUserEventHandler):
         if height <= 3:
             height = 3
 
-        if self.engine.player.x <= 30:
-            x = 40
-        else:
-            x = 0
+        width = min(
+            console.width - 2,
+            max(len(self.TITLE) + 4, 20)
+        )
+
+        x = (console.width - width) // 2
 
         y = 0
-
-        width = len(self.TITLE) + 4
 
         console.draw_frame(
             x=x,
@@ -222,24 +228,34 @@ class IDInputEventHandler(EventHandler):
     def on_render(self, console: Console) -> None:
         console.clear()
 
+        title = "Enter Player ID"
+        id_text = f"ID: {self.current_text}_"
+        help_text = "Press ENTER"
+
+        title_x = (console.width - len(title)) // 2
+        id_x = (console.width - len(id_text)) // 2
+        help_x = (console.width - len(help_text)) // 2
+
+        center_y = console.height // 2
+
         console.print(
-            x=25,
-            y=15,
-            string="Enter Player ID",
+            x=title_x,
+            y=center_y - 2,
+            text=title,
             fg=(255, 255, 255),
         )
 
         console.print(
-            x=25,
-            y=17,
-            string=f"ID: {self.current_text}",
+            x=id_x,
+            y=center_y,
+            text=id_text,
             fg=(255, 255, 0),
         )
 
         console.print(
-            x=25,
-            y=20,
-            string="Type your ID, then press ENTER",
+            x=help_x,
+            y=center_y + 2,
+            text=help_text,
             fg=(180, 180, 180),
         )
 
@@ -295,151 +311,129 @@ class IDInputEventHandler(EventHandler):
         return None
 
 class LeaderboardEventHandler(EventHandler):
+    def __init__(self, engine: Engine):
+        super().__init__(engine)
+        self.top_index = 0
+
     def on_render(self, console: Console) -> None:
         console.clear()
-        console.print(
-            x=2,
-            y=1,
-            string="LEADERBOARD",
-            fg=(255, 255, 0),
-        )
-        console.print(
-            x=2,
-            y=3,
-            string="Score Formula:",
-            fg=(255, 255, 0),
-        )
-        console.print(
-            x=4,
-            y=4,
-            string="Score = Cleared Floors * 1000",
-            fg=(180, 180, 180),
-        )
-        console.print(
-            x=12,
-            y=5,
-            string="+ Monsters Killed * 50",
-            fg=(180, 180, 180),
-        )
-        console.print(
-            x=12,
-            y=6,
-            string="+ Remaining Healing Items * 70",
-            fg=(180, 180, 180),
-        )
-        console.print(
-            x=12,
-            y=7,
-            string="+ Remaining HP * 10",
-            fg=(180, 180, 180),
-        )
-        console.print(
-            x=12,
-            y=8,
-            string="- Overtime Minutes * 300",
-            fg=(180, 180, 180),
-        )
-        console.print(
-            x=2,
-            y=10,
-            string="Rank  ID          Score   Floors  Kills  Items  HP  Time  Overtime",
-            fg=(255, 255, 255),
-        )
 
+        console.print(
+            x=1,
+            y=0,
+            text="=== LEADERBOARD ===",
+            fg=(255, 255, 0),
+        )
+        
         entries = self.engine.leaderboard.to_sorted_list()
 
-        y = 12
+        y = 2
 
-        for rank, entry in enumerate(entries[:10], start=1):
+        visible_entries = entries[
+            self.top_index : self.top_index + 3
+        ]
+
+        for rank, entry in enumerate(
+            visible_entries,
+            start=self.top_index + 1,
+        ):
+            console.print(
+                x=0,
+                y=y,
+                text=f"{rank}. {entry.user_id}",
+                fg=(255,255,255),
+            )
+
+            y += 1
+
             console.print(
                 x=2,
                 y=y,
-                string=(
-                    f"{rank:<5} "
-                    f"{entry.user_id:<11} "
-                    f"{entry.score:<7} "
-                    f"{entry.cleared_floors:<7} "
-                    f"{entry.monsters_killed:<6} "
-                    f"{entry.remaining_items:<6} "
-                    f"{entry.remaining_hp:<3} "
-                    f"{entry.elapsed_minutes:<5} "
-                    f"{entry.overtime_minutes:<8}"
-                ),
-                fg=(220, 220, 220),
+                text=f"Score:{entry.score}",
+                fg=(180,180,180),
             )
-            y += 1
 
-        y += 2
+            y += 2
+
+            if self.top_index > 0:
+                console.print(
+                    x=22,
+                    y=1,
+                    text="^",
+                    fg=(255,255,255),
+                )
+
+            if self.top_index + 3 < len(entries):
+                console.print(
+                    x=22,
+                    y=9,
+                    text="v",
+                    fg=(255,255,255),
+                )
 
         if self.engine.final_score_entry:
             entry = self.engine.final_score_entry
 
-            console.print(x=2, y=y, string="Your Result", fg=(255, 255, 0))
-            y += 2
-
-            console.print(x=2, y=y, string=f"Player ID: {entry.user_id}", fg=(255, 255, 255))
-            y += 1
-            console.print(x=2, y=y, string=f"Final Score: {entry.score}", fg=(255, 255, 255))
-            y += 2
+            y = 11
 
             console.print(
-                x=2,
+                x=0,
                 y=y,
-                string=f"Cleared Floors: {entry.cleared_floors} x 1000 = {entry.cleared_floors * 1000}",
-                fg=(200, 200, 200),
+                text="Your Result",
+                fg=(255,255,0),
             )
+
             y += 1
 
             console.print(
-                x=2,
+                x=0,
                 y=y,
-                string=f"Monsters Killed: {entry.monsters_killed} x 50 = {entry.monsters_killed * 50}",
-                fg=(200, 200, 200),
+                text=f"{entry.user_id}",
+                fg=(255,255,255),
             )
+
             y += 1
 
             console.print(
-                x=2,
+                x=0,
                 y=y,
-                string=f"Remaining Healing Items: {entry.remaining_items} x 70 = {entry.remaining_items * 70}",
-                fg=(200, 200, 200),
-            )
-            y += 1
-
-            console.print(
-                x=2,
-                y=y,
-                string=f"Remaining HP: {entry.remaining_hp} x 10 = {entry.remaining_hp * 10}",
-                fg=(200, 200, 200),
-            )
-            y += 1
-
-            console.print(
-                x=2,
-                y=y,
-                string=f"Overtime Penalty: {entry.overtime_minutes} x 300 = -{entry.overtime_minutes * 300}",
-                fg=(200, 200, 200),
+                text=f"Score:{entry.score}",
+                fg=(255,255,255),
             )
 
         if self.engine.game_finished:
             console.print(
-                x=2,
-                y=46,
-                string="Press P to play again, C to clear scores, E to exit",
-                fg=(255, 255, 255),
+                x=0,
+                y=16,
+                text="P:Replay C:Clear",
+                fg=(255,255,255),
             )
         else:
             console.print(
-                x=2,
-                y=46,
-                string="Press R to resume, C to clear scores, E to exit",
-                fg=(255, 255, 255),
+                x=0,
+                y=16,
+                text="R:Resume C:Clear",
+                fg=(255,255,255),
             )
 
-    def ev_keydown(self, event: tcod.event.KeyDown) -> Optional[Action]:
+    def ev_keydown(self, event: tcod.event.KeyDown) -> Optional[Action]:        
         key = event.sym
 
-        if key == KeySym.E:
+        entries = self.engine.leaderboard.to_sorted_list()
+
+        if key == KeySym.UP:
+            self.top_index = max(0, self.top_index - 1)
+            return None
+
+        elif key == KeySym.DOWN:
+            max_index = max(0, len(entries) - 3)
+
+            self.top_index = min(
+                max_index,
+                self.top_index + 1,
+            )
+            return None
+        elif key == KeySym.E:
             raise SystemExit()
 
         elif key == KeySym.R:
@@ -510,13 +504,13 @@ class HistoryViewer(EventHandler):
     def on_render(self, console: Console) -> None:
         super().on_render(console)
 
-        log_console = Console(console.width - 6, console.height - 6)
+        log_console = Console(console.width - 2, console.height - 2)
 
         log_console.draw_frame(0, 0, log_console.width, log_console.height)
         log_console.print(
             x=0,
             y=0,
-            text="┤Message history├",
+            text="Message history Log",
             width=log_console.width,
             height=1,
             alignment=tcod.CENTER,
@@ -530,7 +524,7 @@ class HistoryViewer(EventHandler):
             log_console.height - 2,
             self.engine.message_log.messages[: self.cursor + 1],
         )
-        log_console.blit(console, 3, 3)
+        log_console.blit(console, 1, 1)
 
     def ev_keydown(self, event: tcod.event.KeyDown) -> None:
         if event.sym in CURSOR_Y_KEYS:
