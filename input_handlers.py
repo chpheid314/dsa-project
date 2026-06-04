@@ -314,6 +314,7 @@ class LeaderboardEventHandler(EventHandler):
     def __init__(self, engine: Engine):
         super().__init__(engine)
         self.top_index = 0
+        self.show_formula = False
 
     def on_render(self, console: Console) -> None:
         console.clear()
@@ -324,52 +325,95 @@ class LeaderboardEventHandler(EventHandler):
             text="=== LEADERBOARD ===",
             fg=(255, 255, 0),
         )
-        
-        entries = self.engine.leaderboard.to_sorted_list()
 
-        y = 2
-
-        visible_entries = entries[
-            self.top_index : self.top_index + 3
-        ]
-
-        for rank, entry in enumerate(
-            visible_entries,
-            start=self.top_index + 1,
-        ):
+        if self.show_formula:
             console.print(
-                x=0,
-                y=y,
-                text=f"{rank}. {entry.user_id}",
-                fg=(255,255,255),
+                x=1,
+                y=3,
+                text="Score Formula",
+                fg=(255, 255, 0),
             )
-
-            y += 1
 
             console.print(
                 x=2,
-                y=y,
-                text=f"Score:{entry.score}",
-                fg=(180,180,180),
+                y=4,
+                text="=Cleared Floors*1000",
+                fg=(180, 180, 180),
             )
 
-            y += 2
+            console.print(
+                x=3,
+                y=5,
+                text="+Monsters Killed*50",
+                fg=(180, 180, 180),
+            )
 
-            if self.top_index > 0:
+            console.print(
+                x=3,
+                y=6,
+                text="+Remaining HP Items*70",
+                fg=(180, 180, 180),
+            )
+
+            console.print(
+                x=3,
+                y=7,
+                text="+Remaining HP*10",
+                fg=(180, 180, 180),
+            )
+
+            console.print(
+                x=3,
+                y=8,
+                text = "-Overtime Minutes*300",
+                fg=(180, 180, 180),
+            )
+        else:
+            entries = self.engine.leaderboard.to_sorted_list()
+
+            y = 2
+
+            visible_entries = entries[
+                self.top_index : self.top_index + 3
+            ]
+
+            for rank, entry in enumerate(
+                visible_entries,
+                start=self.top_index + 1,
+            ):
                 console.print(
-                    x=22,
-                    y=1,
-                    text="^",
+                    x=0,
+                    y=y,
+                    text=f"{rank}. {entry.user_id}",
                     fg=(255,255,255),
                 )
 
-            if self.top_index + 3 < len(entries):
+                y += 1
+
                 console.print(
-                    x=22,
-                    y=9,
-                    text="v",
-                    fg=(255,255,255),
+                    x=2,
+                    y=y,
+                    text=f"Score:{entry.score}",
+                    fg=(180,180,180),
                 )
+
+                y += 2
+
+                if self.top_index > 0:
+                    console.print(
+                        x=22,
+                        y=1,
+                        text="^",
+                        fg=(255,255,255),
+                    )
+
+                if self.top_index + 3 < len(entries):
+                    console.print(
+                        x=22,
+                        y=9,
+                        text="v",
+                        fg=(255,255,255),
+                    )
 
         if self.engine.final_score_entry:
             entry = self.engine.final_score_entry
@@ -405,14 +449,14 @@ class LeaderboardEventHandler(EventHandler):
             console.print(
                 x=0,
                 y=16,
-                text="P:Replay C:Clear",
+                text="P:Replay C:Clear F:Formula",
                 fg=(255,255,255),
             )
         else:
             console.print(
                 x=0,
                 y=16,
-                text="R:Resume C:Clear",
+                text="R:Resume C:Clear F:Formula",
                 fg=(255,255,255),
             )
 
@@ -421,11 +465,11 @@ class LeaderboardEventHandler(EventHandler):
 
         entries = self.engine.leaderboard.to_sorted_list()
 
-        if key == KeySym.UP:
+        if key == KeySym.UP and not self.show_formula:
             self.top_index = max(0, self.top_index - 1)
             return None
 
-        elif key == KeySym.DOWN:
+        elif key == KeySym.DOWN and not self.show_formula:
             max_index = max(0, len(entries) - 3)
 
             self.top_index = min(
@@ -448,6 +492,9 @@ class LeaderboardEventHandler(EventHandler):
         elif key == KeySym.C:
             self.engine.leaderboard = clear_leaderboard()
             self.engine.final_score_entry = None
+        
+        elif key == KeySym.F:
+            self.show_formula = not self.show_formula
 
         return None
 
