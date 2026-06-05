@@ -36,6 +36,7 @@ def new_game() -> Engine:
     )
 
     engine.update_fov()
+    engine.initialize_turn_queue()
 
     engine.message_log.add_message(
         "Hello and welcome, adventurer, to yet another dungeon!",

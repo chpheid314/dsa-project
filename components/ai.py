@@ -2,9 +2,6 @@ from __future__ import annotations
 
 from typing import List, Tuple, TYPE_CHECKING
 
-import numpy as np  # type: ignore
-import tcod
-
 from actions import Action, MeleeAction, MovementAction, WaitAction
 
 if TYPE_CHECKING:
@@ -14,39 +11,91 @@ class BaseAI(Action):
 
     def perform(self) -> None:
         raise NotImplementedError()
-
+    
     def get_path_to(self, dest_x: int, dest_y: int) -> List[Tuple[int, int]]:
-        """Compute and return a path to the target position.
+        """Compute and return a path to the target position using A*.
 
         If there is no valid path then returns an empty list.
         """
-        # Copy the walkable array.
-        cost = np.array(self.entity.gamemap.tiles["walkable"], dtype=np.int8)
 
-        for entity in self.entity.gamemap.entities:
-            # Check that an enitiy blocks movement and the cost isn't zero (blocking.)
-            if entity.blocks_movement and cost[entity.x, entity.y]:
-                # Add to the cost of a blocked position.
-                # A lower number means more enemies will crowd behind each other in
-                # hallways.  A higher number means enemies will take longer paths in
-                # order to surround the player.
-                cost[entity.x, entity.y] += 10
+        import heapq
 
-        # Create a graph from the cost array and pass that graph to a new pathfinder.
-        graph = tcod.path.SimpleGraph(
-            cost=cost,
-            cardinal=1,
-            diagonal=0,
-        )
-        pathfinder = tcod.path.Pathfinder(graph)
+        start = (self.entity.x, self.entity.y)
+        goal = (dest_x, dest_y)
 
-        pathfinder.add_root((self.entity.x, self.entity.y))  # Start position.
+        gamemap = self.entity.gamemap
 
-        # Compute the path to the destination and remove the starting point.
-        path: List[List[int]] = pathfinder.path_to((dest_x, dest_y))[1:].tolist()
+        def heuristic(a: Tuple[int, int], b: Tuple[int, int]) -> int:
+            """Manhattan distance heuristic for 4-direction movement."""
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-        # Convert from List[List[int]] to List[Tuple[int, int]].
-        return [(index[0], index[1]) for index in path]
+        def movement_cost(x: int, y: int) -> int:
+            """Return movement cost for a tile.
+
+            Walls are not handled here because neighbors are checked before calling this.
+            Blocking entities get extra cost so enemies avoid crowding.
+            """
+            cost = 1
+
+            for entity in gamemap.entities:
+                if entity.blocks_movement and entity.x == x and entity.y == y:
+                    cost += 10
+
+            return cost
+
+        open_set = []
+        heapq.heappush(open_set, (0, start))
+
+        came_from: dict[Tuple[int, int], Tuple[int, int]] = {}
+
+        g_score: dict[Tuple[int, int], int] = {
+            start: 0
+        }
+
+        # 4-direction movement: up, down, left, right.
+        directions = [
+            (0, -1),
+            (0, 1),
+            (-1, 0),
+            (1, 0),
+        ]
+
+        while open_set:
+            current_f, current = heapq.heappop(open_set)
+
+            if current == goal:
+                path = []
+
+                while current != start:
+                    path.append(current)
+                    current = came_from[current]
+
+                path.reverse()
+                return path
+
+            current_x, current_y = current
+
+            for dx, dy in directions:
+                neighbor_x = current_x + dx
+                neighbor_y = current_y + dy
+                neighbor = (neighbor_x, neighbor_y)
+
+                if not gamemap.in_bounds(neighbor_x, neighbor_y):
+                    continue
+
+                if not gamemap.tiles["walkable"][neighbor_x, neighbor_y]:
+                    continue
+
+                tentative_g_score = g_score[current] + movement_cost(neighbor_x, neighbor_y)
+
+                if tentative_g_score < g_score.get(neighbor, 999999):
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+
+                    f_score = tentative_g_score + heuristic(neighbor, goal)
+                    heapq.heappush(open_set, (f_score, neighbor))
+
+        return []
     
 class HostileEnemy(BaseAI):
     def __init__(self, entity: Actor):

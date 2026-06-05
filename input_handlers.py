@@ -74,7 +74,7 @@ class EventHandler(tcod.event.EventDispatch[Action]):
             self.engine.undo_history.pop()
             return False
 
-        self.engine.handle_enemy_turns()
+        self.engine.handle_turns_after_player()
         self.engine.update_fov()
         return True
 
