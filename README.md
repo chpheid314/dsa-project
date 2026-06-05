@@ -34,8 +34,15 @@ pip install tcod numpy
 
 Run the following command in the project root directory.
 
+- Windows
+
+```cmd
+python -W ignore::DeprecationWarning main.py
+```
+- Mac
+
 ```bash
-python main.py
+./run.sh
 ```
 
 ---
