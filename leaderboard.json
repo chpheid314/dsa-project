@@ -20,6 +20,16 @@
         "overtime_minutes": 0
     },
     {
+        "user_id": "abc",
+        "score": 5060,
+        "cleared_floors": 3,
+        "monsters_killed": 25,
+        "remaining_items": 10,
+        "remaining_hp": 11,
+        "elapsed_minutes": 3,
+        "overtime_minutes": 0
+    },
+    {
         "user_id": "minah",
         "score": 3600,
         "cleared_floors": 2,
