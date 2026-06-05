@@ -35,6 +35,8 @@ class Engine:
         self.undo_history = deque(maxlen=30)
         self.redo_history = deque(maxlen=30)
 
+        self.turn_queue = deque()
+
         self.user_id = ""
 
         self.start_time = 0.0
@@ -52,13 +54,42 @@ class Engine:
         self.camera_width = 26
         self.camera_height = 12
 
-    def handle_enemy_turns(self) -> None:
-        for entity in set(self.game_map.actors) - {self.player}:
-            if entity.ai:
+
+    def handle_turns_after_player(self) -> None:
+        """Process turns until it becomes the player's turn again."""
+        while self.turn_queue:
+            current_actor = self.turn_queue.popleft()
+
+            # If the player is dead, stop processing turns.
+            if not self.player.is_alive:
+                return
+
+            # The player's turn has come back.
+            if current_actor is self.player:
+                self.turn_queue.append(current_actor)
+                return
+
+            if not current_actor.is_alive:
+                continue
+
+            self.turn_queue.append(current_actor)
+
+            if current_actor.ai:
                 try:
-                    entity.ai.perform()
+                    current_actor.ai.perform()
                 except exceptions.Impossible:
-                    pass  # Ignore impossible action exceptions from AI.
+                    pass # Ignore impossible action exceptions from AI.
+
+
+    def initialize_turn_queue(self) -> None:
+        """Initialize the turn queue with the player first, then all living enemies."""
+        self.turn_queue.clear()
+        self.turn_queue.append(self.player)
+
+        for actor in self.game_map.actors:
+            if actor is not self.player and actor.is_alive:
+                self.turn_queue.append(actor)
+
 
     def update_fov(self) -> None:
         """Recompute the visible area based on the players point of view."""
@@ -69,6 +100,7 @@ class Engine:
         )
         # If a tile is "visible" it should be added to "explored".
         self.game_map.explored |= self.game_map.visible
+
 
     def advance_level(self) -> None:
         self.current_floor += 1
@@ -106,9 +138,13 @@ class Engine:
         self.player.fighter.hp = self.player.fighter.max_hp
 
         self.update_fov()
+        self.update_fov()
+        
+        self.initialize_turn_queue()
 
         self.undo_history.clear()
         self.redo_history.clear()
+
 
     def get_camera_origin(self) -> tuple[int, int]:
         camera_x = self.player.x - self.camera_width // 2
@@ -128,7 +164,8 @@ class Engine:
         )
 
         return camera_x, camera_y
-            
+
+
     def render(self, console: Console) -> None:
         self.game_map.render(console)
 
@@ -205,11 +242,15 @@ class Engine:
         state["undo_history"] = deque(maxlen=30)
         state["redo_history"] = deque(maxlen=30)
 
+        state["turn_queue"] = deque()
+
         return state
+
 
     def save_undo_state(self) -> None:
         self.undo_history.append(copy.deepcopy(self))
         self.redo_history.clear()
+
 
     def restore_state(self, snapshot: "Engine") -> None:
         self.message_log = copy.deepcopy(snapshot.message_log)
@@ -236,7 +277,9 @@ class Engine:
 
         self.event_handler = MainGameEventHandler(self)
 
+        self.initialize_turn_queue()
         self.update_fov()
+
 
     def undo(self) -> None:
         if not self.undo_history:
@@ -246,6 +289,7 @@ class Engine:
         self.redo_history.append(copy.deepcopy(self))
         snapshot = self.undo_history.pop()
         self.restore_state(snapshot)
+
 
     def redo(self) -> None:
         if not self.redo_history:
